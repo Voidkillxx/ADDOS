@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>A-DDoS — Threat Mitigation Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="/static/style.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <!-- Header -->
+  <header>
+    <div>
+      <div class="logo-name"><span>A-</span>DDoS</div>
+      <div class="logo-sub">Threat Detection &amp; Mitigation System</div>
+    </div>
+    <div class="header-right">
+      <div class="status-pill"><div class="dot"></div>System Active</div>
+      <button class="theme-btn" id="theme-btn" onclick="toggleTheme()">☀ Light Mode</button>
+      <button class="btn" onclick="openModal()">Generate Report</button>
+    </div>
+  </header>
+
+  <!-- Metric Cards -->
+  <div class="cards-grid">
+    <div class="metric-card" style="--accent:var(--blue)">
+      <div class="m-label">Total Packets Detected</div>
+      <div class="m-value" id="c-total">—</div>
+      <div class="m-sub" id="c-total-s">—</div>
+    </div>
+    <div class="metric-card" style="--accent:var(--red)">
+      <div class="m-label">Malicious Packets Dropped</div>
+      <div class="m-value" id="c-mal">—</div>
+      <div class="m-sub" style="color:var(--red)" id="c-mal-s">—</div>
+    </div>
+    <div class="metric-card" style="--accent:var(--green)">
+      <div class="m-label">Normal Traffic</div>
+      <div class="m-value" id="c-norm">—</div>
+      <div class="m-sub" style="color:var(--green)" id="c-norm-s">—</div>
+    </div>
+    <div class="metric-card" style="--accent:var(--amber)">
+      <div class="m-label">Active Threats</div>
+      <div class="m-value" id="c-thr">—</div>
+      <div class="m-sub" style="color:var(--amber)">Currently being mitigated</div>
+    </div>
+  </div>
+
+  <!-- Live Traffic Chart -->
+  <div class="panel">
+    <div class="panel-header">
+      <div class="panel-title">
+        Live Traffic Monitor
+        <span class="badge">REAL-TIME</span>
+      </div>
+      <div class="range-tabs" id="rtabs">
+        <button class="rt active" data-r="Live">Live</button>
+        <button class="rt" data-r="1hr">1 hr</button>
+        <button class="rt" data-r="12hr">12 hr</button>
+        <button class="rt" data-r="24hr">24 hr</button>
+        <button class="rt" data-r="session">Session</button>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="chart"></canvas>
+    </div>
+  </div>
+
+  <!-- Performance Row -->
+  <div class="perf-grid">
+    <div class="perf-card">
+      <div class="p-label">Detection Model</div>
+      <div class="p-value">Isolation Forest</div>
+      <div class="p-detail" id="p-if">Accuracy: —</div>
+    </div>
+    <div class="perf-card">
+      <div class="p-label">Classification Model</div>
+      <div class="p-value">Random Forest</div>
+      <div class="p-detail" id="p-rf">Accuracy: —</div>
+    </div>
+    <div class="perf-card">
+      <div class="p-label">Response Time</div>
+      <div class="p-value" id="p-rt">— ms</div>
+      <div class="p-detail">Average mitigation latency</div>
+    </div>
+    <div class="perf-card">
+      <div class="p-label">False Positive Rate</div>
+      <div class="p-value" id="p-fp">— %</div>
+      <div class="p-detail">Legitimate traffic blocked</div>
+    </div>
+  </div>
+
+  <!-- Mitigation Audit Log -->
+  <div class="panel">
+    <div class="panel-header">
+      <div class="panel-title">
+        Mitigation Audit Log
+        <span class="badge" id="log-ct">0</span>
+      </div>
+      <div class="panel-sub">ML: Isolation Forest + Random Forest</div>
+    </div>
+    <div class="tbl-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Timestamp</th>
+            <th>Source IP</th>
+            <th>Class</th>
+            <th>Attack Vector</th>
+            <th>Confidence</th>
+            <th>Priority</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="log-body">
+          <tr>
+            <td colspan="7" style="padding:36px;text-align:center;color:var(--sub);font-family:var(--mono);font-size:11px">
+              Waiting for events…
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Quarantine Panel -->
+  <div class="panel">
+    <div class="panel-header">
+      <div class="panel-title">
+        Active Quarantine &amp; Watch List
+        <span class="badge" id="q-ct">0 IPs</span>
+      </div>
+    </div>
+    <div class="tbl-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>IP Address</th>
+            <th>Phase</th>
+            <th>Attack Vector</th>
+            <th>IF Score</th>
+            <th>Confidence</th>
+            <th>Time in Phase</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="q-body">
+          <tr>
+            <td colspan="7" class="q-empty">No IPs currently under active mitigation.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div><!-- /app -->
+
+<!-- Report Modal -->
+<div class="overlay" id="modal">
+  <div class="modal">
+    <h2>Generate Report</h2>
+    <div class="modal-row">
+      <div><label>Start Date</label><input type="date" id="r-start"/></div>
+      <div><label>End Date</label><input type="date" id="r-end"/></div>
+    </div>
+    <div class="modal-err" id="m-err"></div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" onclick="submitReport()">Generate</button>
+    </div>
+  </div>
+</div>
+
+<div id="toaster"></div>
+
+<!-- Inject backend URL and config from Python -->
+<script>
+  window.API_URL  = "{{ api_url }}";
+  window.POLL_MS  = {{ poll_ms }};
+  window.MAX_PTS  = {{ max_pts }};
+  window.MAX_LOG  = {{ max_log }};
+</script>
+<script src="/static/main.js"></script>
+</body>
+</html>

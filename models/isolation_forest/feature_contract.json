@@ -1,0 +1,27 @@
+{
+  "feature_names": [
+    "flow_duration_sec",
+    "flow_duration_nsec",
+    "idle_timeout",
+    "hard_timeout",
+    "flags",
+    "packet_count",
+    "byte_count",
+    "packet_count_per_second",
+    "packet_count_per_nsecond",
+    "byte_count_per_second",
+    "byte_count_per_nsecond",
+    "flow_duration_total_ns",
+    "bytes_per_packet",
+    "pkt_byte_rate_ratio"
+  ],
+  "n_features": 14,
+  "threshold": 0.6201164786634781,
+  "score_sign": "negated",
+  "score_formula": "if_score = -model.score_samples(X)",
+  "anomaly_rule": "is_anomaly = (if_score >= threshold)",
+  "contamination": 0.05,
+  "trained_on": "NORMAL only (label=0)",
+  "label_convention": "0=Normal, 1=Attack",
+  "dataset": "SNT + Mininet augmentation (flow_duration up to 2230s)"
+}
