@@ -1,1 +1,7 @@
 models/isolation_forest/isolation_forest.pkl
+*.pkl
+*.joblib
+logs/
+*.db
+*.db-shm
+*.db-wal
