@@ -17,25 +17,27 @@ _stats = {
     "malicious_dropped": 0,
     "normal_packets":    0,
     "false_positives":   0,
-    "ml_processed":      0,   # flows that ran IF — correct FPR denominator
+    "ml_processed":      0,
     "total_latency_ms":  0.0,
     "latency_samples":   0,
 }
 
-# SSE event buffer — drained by api/events.py every 500ms
 _sse_lock   = threading.Lock()
 _sse_buffer: collections.deque = collections.deque(maxlen=200)
 
-# SSE dedup: prevent same IP flooding audit log (20 switches × same flow = 20 entries)
-# Key: (src_ip, attack_vector), Value: last push timestamp
 _sse_dedup: dict = {}
-_SSE_DEDUP_TTL = 5.0   # seconds — one audit entry per IP per 5s
+_SSE_DEDUP_TTL = 5.0
+
+# ── Pending restores — IPs awaiting baseline traffic restart after manual release
+_restore_lock     = threading.Lock()
+_pending_restores: set[str] = set()
 
 
 def get_stats() -> dict:
     with _lock:
         s = _stats.copy()
-    total   = max(s["total_packets"], 1)
+    # L13 fix: removed dead `total = max(s["total_packets"], 1)` variable
+    # that was computed but never referenced anywhere in the returned dict.
     samples = max(s["latency_samples"], 1)
     return {
         "total_packets":     s["total_packets"],
@@ -45,6 +47,41 @@ def get_stats() -> dict:
         "fp_rate":           round((s["false_positives"] / max(s["ml_processed"], 1)) * 100, 2),
         "avg_latency_ms":    round(s["total_latency_ms"] / samples, 1),
     }
+
+
+# ── FP rate fix ────────────────────────────────────────────────────────────────
+
+def record_false_positive(src_ip: str) -> None:
+    """Called by quarantine.py on every manual release.
+
+    Manual release = operator confirmed a blocked host was legitimate = real FP.
+
+    H4 fix: also buffers fp=1 into traffic_summary so the PDF report's
+    FP rate reflects operational ground truth.  The flush guard in writer.py
+    was also fixed (it previously skipped total=0 entries, dropping FP rows).
+
+    Also queues src_ip for auto-restoration of baseline traffic (Feature 2).
+    """
+    with _lock:
+        _stats["false_positives"] += 1
+    # H4: write to traffic_summary so report.py sees it (flushed within 5s)
+    writer.log_traffic_summary(total=0, threats=0, true_neg=0, fp=1)
+    # Feature 2: queue for baseline restore polling
+    with _restore_lock:
+        _pending_restores.add(src_ip)
+    log.info("FP recorded for %s (manual release). fp_total=%d",
+             src_ip, _stats["false_positives"])
+
+
+def drain_pending_restores() -> list[str]:
+    """Drain and return IPs queued for baseline traffic restoration.
+
+    Called by GET /api/pending_restores, polled by topology.py every 5s.
+    """
+    with _restore_lock:
+        ips = list(_pending_restores)
+        _pending_restores.clear()
+    return ips
 
 
 def drain_sse_events() -> list[dict]:
@@ -60,10 +97,9 @@ def _push_sse_event(event: dict) -> None:
     with _sse_lock:
         last = _sse_dedup.get(key, 0)
         if now - last < _SSE_DEDUP_TTL:
-            return   # suppress duplicate — same IP+vector within TTL
+            return
         _sse_dedup[key] = now
         _sse_buffer.append(event)
-        # Prune expired dedup entries to prevent memory leak
         expired = [k for k, t in _sse_dedup.items() if now - t > _SSE_DEDUP_TTL * 10]
         for k in expired:
             del _sse_dedup[k]
@@ -80,7 +116,6 @@ def on_result(src_ip: str, if_score, is_anomaly,
               attack_class, confidence, *,
               flow_stats: dict = None, switch_stats: dict = None,
               timed_out: bool) -> None:
-    """Registered as worker result callback. Runs in worker thread."""
     t_start = time.monotonic()
 
     with _lock:
@@ -93,7 +128,6 @@ def on_result(src_ip: str, if_score, is_anomaly,
         log.warning("Fallback block: %s (pipeline timeout)", src_ip)
         return
 
-    # Log all IF + RF features for every inference (anomaly or not)
     writer.log_detection_features(
         src_ip=src_ip,
         if_score=if_score or 0.0,
@@ -105,7 +139,7 @@ def on_result(src_ip: str, if_score, is_anomaly,
     )
 
     with _lock:
-        _stats["ml_processed"] += 1   # count every flow that ran IF
+        _stats["ml_processed"] += 1
 
     if not is_anomaly:
         with _lock:
@@ -115,30 +149,28 @@ def on_result(src_ip: str, if_score, is_anomaly,
 
     loader.require_loaded()
 
-    # ── Confidence gate ────────────────────────────────────────────────────────
     is_uncertain    = (attack_class == "Uncertain")
     below_conf_gate = (confidence is None or confidence < loader.rf_conf_gate)
 
     if is_uncertain and below_conf_gate:
         with _lock:
-            _stats["normal_packets"]  += 1
-            _stats["false_positives"] += 1
-        writer.log_traffic_summary(total=1, threats=0, true_neg=0, fp=1)
+            _stats["normal_packets"] += 1
+            # Not incrementing false_positives — these flows were never blocked,
+            # so they are not operational false positives.
+        writer.log_traffic_summary(total=1, threats=0, true_neg=0, fp=0)
         log.debug("Skipping %s — Uncertain %.1f%% < gate %.0f%%",
                   src_ip, (confidence or 0)*100, loader.rf_conf_gate*100)
         return
 
-    # Extra gate: any class with confidence < 0.60 = noise, not a real attack
     if confidence is not None and confidence < 0.60:
         with _lock:
-            _stats["normal_packets"]  += 1
-            _stats["false_positives"] += 1
-        writer.log_traffic_summary(total=1, threats=0, true_neg=0, fp=1)
+            _stats["normal_packets"] += 1
+            # Same reasoning — not blocked, not a real operational FP.
+        writer.log_traffic_summary(total=1, threats=0, true_neg=0, fp=0)
         log.debug("Skipping %s — low confidence %.1f%% (class=%s)",
                   src_ip, confidence*100, attack_class)
         return
 
-    # ── Confirmed threat — proceed with mitigation ────────────────────────────
     predicted_class = "DDoS" if attack_class != "Uncertain" else "Anomaly"
     priority        = _assign_priority(if_score, confidence)
     action_taken    = state_machine.on_detection(

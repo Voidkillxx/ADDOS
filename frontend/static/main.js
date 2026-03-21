@@ -2,9 +2,9 @@
    API_URL is injected by the Jinja2 template as window.API_URL
 */
 const API     = window.API_URL;
-const POLL_MS = window.POLL_MS   || 2000;
-const MAX_PTS = window.MAX_PTS   || 30;
-const MAX_LOG = window.MAX_LOG   || 100;
+const POLL_MS = window.POLL_MS || 2000;
+const MAX_PTS = window.MAX_PTS || 30;
+const MAX_LOG = window.MAX_LOG || 100;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let range  = 'Live';
@@ -64,24 +64,26 @@ async function fetchStats() {
   try {
     const s = await apiFetch('/api/stats');
 
-    // Summary cards use persistent DB totals (survive restarts)
     const ct  = s.total_packets     || 0;
     const cm  = s.malicious_dropped || 0;
     const cn  = s.normal_packets    || 0;
     const tot = Math.max(ct, 1);
-    const pctDelta = (c, p) => { const d = ((c-p)/Math.max(p,1))*100; return (d>=0?'+':'')+d.toFixed(1)+'%'; };
+    const pctDelta = (c, p) => {
+      const d = ((c - p) / Math.max(p, 1)) * 100;
+      return (d >= 0 ? '+' : '') + d.toFixed(1) + '%';
+    };
 
     set('c-total',   ct.toLocaleString());
     set('c-total-s', pctDelta(ct, prev.t));
     set('c-mal',     cm.toLocaleString());
-    set('c-mal-s',   `-${((cm/tot)*100).toFixed(1)}%`);
+    set('c-mal-s',   `-${((cm / tot) * 100).toFixed(1)}%`);
     set('c-norm',    cn.toLocaleString());
-    set('c-norm-s',  `+${((cn/tot)*100).toFixed(1)}%`);
+    set('c-norm-s',  `+${((cn / tot) * 100).toFixed(1)}%`);
     set('c-thr',     (s.active_threats || 0).toString());
     set('p-rt',      `${s.avg_latency_ms || 0} ms`);
 
     const fpRate = typeof s.fp_rate === 'number' ? s.fp_rate : 0;
-    const fpEl = document.getElementById('p-fp');
+    const fpEl   = document.getElementById('p-fp');
     if (fpEl) {
       fpEl.textContent = `${fpRate.toFixed(1)} %`;
       fpEl.style.color = fpRate === 0 ? 'var(--ok, #00d68f)'
@@ -90,19 +92,14 @@ async function fetchStats() {
                        : 'var(--danger, #ff3d5a)';
     }
 
-    // ── Live chart: use raw ZMQ counters (live_* fields) ──────────────────────
-    // These are sourced from zmq_receiver which counts packet_count from ALL
-    // flow_stats — including baseline traffic below the ML threshold — so the
-    // chart shows real network activity at all times, not just during attacks.
     if (range === 'Live') {
       const lt = s.live_total     || 0;
       const lm = s.live_malicious || 0;
       const ln = s.live_normal    || 0;
 
-      // Skip the very first poll — seed prev to avoid a spike from (lt - 0)
       if (prev.t !== 0) {
-        const now = new Date().toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
-        pushChartPoint(now, Math.max(lt-prev.t,0), Math.max(lm-prev.m,0), Math.max(ln-prev.n,0));
+        const now = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        pushChartPoint(now, Math.max(lt - prev.t, 0), Math.max(lm - prev.m, 0), Math.max(ln - prev.n, 0));
       }
       prev = { t: lt, m: lm, n: ln };
     }
@@ -110,7 +107,9 @@ async function fetchStats() {
   } catch (_) {}
 }
 
-// ── Model info ────────────────────────────────────────────────────────────────
+// ── Model info — fetched ONCE at boot, never polled again ─────────────────────
+// M11 fix: model_info never changes at runtime (loaded once at backend startup).
+// Polling it every 2s generated 1,800 pointless HTTP requests per hour per tab.
 async function fetchModelInfo() {
   try {
     const info = await apiFetch('/api/model_info');
@@ -131,14 +130,31 @@ async function fetchQuarantine() {
       return;
     }
     tb.innerHTML = data.map(e => {
-      const sc   = e.if_score || 0;
-      const ts   = e.time_in_phase_sec || 0;
-      const conf = typeof e.confidence === 'number' ? `${(e.confidence*100).toFixed(1)}%` : (e.confidence || '—');
-      const time = ts < 60 ? `${ts}s` : `${Math.floor(ts/60)}m ${ts%60}s`;
-      const scCls = !ifThr ? 'mono' : sc >= ifThr*1.2 ? 'sc-red' : sc >= ifThr ? 'sc-amb' : 'sc-grn';
+      const sc  = e.if_score || 0;
+      const ts  = e.time_in_phase_sec || 0;
+
+      // L15 fix: to_api_dict() in state_machine.py returns confidence already
+      // formatted as a string like "68.1%".  The old code had:
+      //   typeof e.confidence === 'number' ? `${(e.confidence*100).toFixed(1)}%` : e.confidence
+      // The number branch was always false (typeof "68.1%" === 'string'), so
+      // the formatted string was silently used as-is anyway — but the branch
+      // was dead code and masked the actual type contract.  Fixed: use the
+      // string directly since state_machine guarantees the format.
+      const conf   = e.confidence || '—';
+      const time   = ts < 60 ? `${ts}s` : `${Math.floor(ts / 60)}m ${ts % 60}s`;
+      const scCls  = !ifThr ? 'mono'
+                   : sc >= ifThr * 1.2 ? 'sc-red'
+                   : sc >= ifThr       ? 'sc-amb'
+                   : 'sc-grn';
+
+      // Show TTL remaining if present (Feature 1 — auto-block expiry)
+      const ttlRemaining = e.ttl_remaining_sec != null
+        ? ` <span style="color:var(--sub);font-size:10px;font-family:var(--mono)">[TTL ${Math.floor(e.ttl_remaining_sec / 60)}m]</span>`
+        : '';
+
       return `<tr>
         <td class="ip">${e.src_ip || '—'}</td>
-        <td style="color:var(--sub2);font-size:11px">${e.phase || '—'}</td>
+        <td style="color:var(--sub2);font-size:11px">${e.phase || '—'}${ttlRemaining}</td>
         <td>${renderVector(e.attack_vector || '—')}</td>
         <td class="${scCls}">${sc.toFixed(4)}</td>
         <td class="mono">${conf}</td>
@@ -155,8 +171,8 @@ async function fetchQuarantine() {
 // ── Graph history ─────────────────────────────────────────────────────────────
 async function fetchHistory(r) {
   try {
-    const buckets = await apiFetch(`/api/graph_history?range=${r}`);
-    const d = chart.data;
+    const buckets      = await apiFetch(`/api/graph_history?range=${r}`);
+    const d            = chart.data;
     d.labels           = buckets.map(b => b.timestamp.slice(11, 16));
     d.datasets[0].data = buckets.map(b => b.incoming  || 0);
     d.datasets[1].data = buckets.map(b => b.blocked   || 0);
@@ -180,13 +196,13 @@ function pushChartPoint(label, di, db, df) {
 
 // ── SSE live events ───────────────────────────────────────────────────────────
 function connectSSE() {
-  const es = new EventSource(`${API}/api/events`);
+  const es  = new EventSource(`${API}/api/events`);
   es.onmessage = e => { try { addLogRow(JSON.parse(e.data)); } catch (_) {} };
   es.onerror   = () => { es.close(); setTimeout(connectSSE, 3000); };
 }
 
 function addLogRow(ev) {
-  const tb = document.getElementById('log-body');
+  const tb          = document.getElementById('log-body');
   const placeholder = tb.querySelector('[colspan]');
   if (placeholder) placeholder.parentElement.remove();
 
@@ -198,9 +214,9 @@ function addLogRow(ev) {
   }
   set('log-ct', logCt.toString());
 
-  const tr = document.createElement('tr');
-  tr.className = 'row-in';
-  tr.innerHTML = `
+  const tr      = document.createElement('tr');
+  tr.className  = 'row-in';
+  tr.innerHTML  = `
     <td class="mono">${ev.timestamp      || '—'}</td>
     <td class="ip">${ev.src_ip           || '—'}</td>
     <td>${renderClass(ev.predicted_class || '—')}</td>
@@ -215,9 +231,9 @@ function addLogRow(ev) {
 async function quarantineAction(action, ip) {
   try {
     await fetch(`${API}/api/quarantine/${action}`, {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ src_ip: ip }),
+      body:    JSON.stringify({ src_ip: ip }),
     });
     showToast(action === 'release' ? `Released ${ip}` : `Blocked ${ip}`);
     fetchQuarantine();
@@ -229,9 +245,9 @@ async function quarantineAction(action, ip) {
 // ── Report modal ──────────────────────────────────────────────────────────────
 function openModal() {
   const today = new Date().toISOString().split('T')[0];
-  const week  = new Date(Date.now() - 7*86400000).toISOString().split('T')[0];
-  document.getElementById('r-start').value = week;
-  document.getElementById('r-end').value   = today;
+  const week  = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+  document.getElementById('r-start').value    = week;
+  document.getElementById('r-end').value      = today;
   document.getElementById('m-err').textContent = '';
   document.getElementById('modal').classList.add('open');
 }
@@ -248,16 +264,16 @@ async function submitReport() {
   const sd  = document.getElementById('r-start').value;
   const ed  = document.getElementById('r-end').value;
   const err = document.getElementById('m-err');
-  if (!sd || !ed)                                           { err.textContent = 'Select both dates.'; return; }
-  if (ed < sd)                                              { err.textContent = 'End must be after start.'; return; }
-  if (ed > new Date().toISOString().split('T')[0])          { err.textContent = 'End date cannot be in the future.'; return; }
+  if (!sd || !ed)                                          { err.textContent = 'Select both dates.'; return; }
+  if (ed < sd)                                             { err.textContent = 'End must be after start.'; return; }
+  if (ed > new Date().toISOString().split('T')[0])         { err.textContent = 'End date cannot be in the future.'; return; }
   err.textContent = '';
   closeModal();
   try {
     const r = await fetch(`${API}/api/report`, {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ start_date: sd, end_date: ed }),
+      body:    JSON.stringify({ start_date: sd, end_date: ed }),
     });
     if (r.status === 404) { const j = await r.json(); showToast(j.error || 'No data.', true); return; }
     if (!r.ok)            { showToast(`Error: ${r.status}`, true); return; }
@@ -302,8 +318,8 @@ function set(id, val) {
 }
 
 function showToast(msg, isErr = false) {
-  const el = document.createElement('div');
-  el.className = 'toast';
+  const el      = document.createElement('div');
+  el.className  = 'toast';
   if (isErr) el.style.borderColor = 'rgba(255,61,90,.4)';
   el.textContent = msg;
   document.getElementById('toaster').appendChild(el);
@@ -322,11 +338,11 @@ function toggleTheme() {
   const tickColor   = isLight ? '#6b7280' : '#5c6080';
   const legendColor = isLight ? '#4b5563' : '#5c6080';
 
-  chart.options.scales.x.grid.color          = gridColor;
-  chart.options.scales.y.grid.color          = gridColor;
-  chart.options.scales.x.ticks.color         = tickColor;
-  chart.options.scales.y.ticks.color         = tickColor;
-  chart.options.plugins.legend.labels.color  = legendColor;
+  chart.options.scales.x.grid.color         = gridColor;
+  chart.options.scales.y.grid.color         = gridColor;
+  chart.options.scales.x.ticks.color        = tickColor;
+  chart.options.scales.y.ticks.color        = tickColor;
+  chart.options.plugins.legend.labels.color = legendColor;
   chart.options.plugins.tooltip.backgroundColor = isLight ? '#ffffff' : '#111320';
   chart.options.plugins.tooltip.titleColor      = isLight ? '#6b7280' : '#8890b0';
   chart.options.plugins.tooltip.bodyColor       = isLight ? '#111827' : '#e8eaf6';
@@ -337,15 +353,16 @@ function toggleTheme() {
 }
 
 // Restore saved theme on load
-(function() {
+(function () {
   if (localStorage.getItem('adddos-theme') === 'light') toggleTheme();
 })();
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 fetchStats();
-fetchModelInfo();
+fetchModelInfo();   // M11 fix: called once here, NOT added to setInterval
 fetchQuarantine();
 connectSSE();
-setInterval(fetchStats,       POLL_MS);
-setInterval(fetchModelInfo,   POLL_MS);
-setInterval(fetchQuarantine,  POLL_MS);
+setInterval(fetchStats,      POLL_MS);
+setInterval(fetchQuarantine, POLL_MS);
+// fetchModelInfo is intentionally absent from setInterval —
+// model config is static for the lifetime of the backend process.
