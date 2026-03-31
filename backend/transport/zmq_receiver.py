@@ -85,9 +85,21 @@ def _parse_and_route(raw: bytes) -> None:
         if delta_pkts == 0:
             return
 
-        MIN_FLOW_PKTS     = 1
-        MIN_PPS           = 20.0
-        crosses_threshold = (pkt_count_cumulative >= MIN_FLOW_PKTS and pps >= MIN_PPS)
+        MIN_FLOW_PKTS = 1
+        MIN_PPS       = 20.0
+
+        # Bug 2 fix: rand-source flood flows have pkt_count=1 and short duration.
+        # Their computed pps = 1/duration_sec which can be < 20 → filtered.
+        # During a flood (switch_delta_pps >= 80), bypass MIN_PPS entirely.
+        # switch_delta_pps is now correctly boosted by rate_pkt_in in ryu_controller
+        # (Bug 1 fix) so this flag is reliable even with throttled flows.
+        switch_delta_pps = float(flow_stats.get("switch_delta_pps", 0.0))
+        is_flood_mode    = switch_delta_pps >= 80.0
+
+        crosses_threshold = (
+            pkt_count_cumulative >= MIN_FLOW_PKTS
+            and (pps >= MIN_PPS or is_flood_mode)
+        )
 
         with _raw_lock:
             _raw_total_pkts += delta_pkts

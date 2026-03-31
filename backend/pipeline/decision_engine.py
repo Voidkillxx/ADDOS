@@ -32,6 +32,52 @@ _SSE_DEDUP_TTL = 5.0
 _restore_lock     = threading.Lock()
 _pending_restores: set[str] = set()
 
+# ── Scan log — rolling buffer of last 200 flow evaluations for /api/debug/flows
+_scan_lock   = threading.Lock()
+_scan_buffer: collections.deque = collections.deque(maxlen=200)
+
+
+def push_scan_result(src_ip: str, pps: float, sw_delta: float,
+                     if_score: float, threshold: float, is_anomaly: bool,
+                     attack_class: str, confidence: float) -> None:
+    """Called by worker for every flow that runs through IF inference."""
+    import datetime
+    entry = {
+        "ts":          datetime.datetime.now().strftime("%H:%M:%S"),
+        "src_ip":      src_ip,
+        "pps":         round(pps, 1),
+        "sw_delta":    round(sw_delta, 1),
+        "if_score":    round(if_score, 4),
+        "threshold":   round(threshold, 4),
+        "is_anomaly":  is_anomaly,
+        "attack_class": attack_class if is_anomaly else "Normal",
+        "confidence":  f"{confidence*100:.1f}%" if is_anomaly else "—",
+    }
+    with _scan_lock:
+        _scan_buffer.appendleft(entry)
+
+
+def get_scan_log() -> list[dict]:
+    with _scan_lock:
+        return list(_scan_buffer)
+
+# ── Pipeline debug log — rolling buffer of last 200 inference results
+# Each entry: {src_ip, pps, if_score, threshold, is_anomaly,
+#              attack_class, confidence, action, ts}
+# Exposed via GET /api/debug so operators can see what the ML pipeline is doing.
+_debug_lock   = threading.Lock()
+_debug_buffer: collections.deque = collections.deque(maxlen=200)
+
+
+def get_debug_log() -> list[dict]:
+    with _debug_lock:
+        return list(reversed(_debug_buffer))   # newest first
+
+
+def _push_debug(entry: dict) -> None:
+    with _debug_lock:
+        _debug_buffer.append(entry)
+
 
 def get_stats() -> dict:
     with _lock:
@@ -141,6 +187,20 @@ def on_result(src_ip: str, if_score, is_anomaly,
     with _lock:
         _stats["ml_processed"] += 1
 
+    # ── Debug log — record every inference result ─────────────────────────────
+    _pps = float((flow_stats or {}).get("packet_count_per_second", 0.0))
+    _push_debug({
+        "ts":          datetime.datetime.now().strftime("%H:%M:%S"),
+        "src_ip":      src_ip,
+        "pps":         round(_pps, 2),
+        "if_score":    round(if_score or 0.0, 4),
+        "threshold":   round(loader.if_threshold, 4) if loader._loaded else 0,
+        "is_anomaly":  bool(is_anomaly),
+        "attack_class": attack_class or "Normal",
+        "confidence":  round((confidence or 0.0) * 100, 1),
+        "action":      "pending",
+    })
+
     if not is_anomaly:
         with _lock:
             _stats["normal_packets"] += 1
@@ -203,6 +263,19 @@ def on_result(src_ip: str, if_score, is_anomaly,
     with _lock:
         _stats["total_latency_ms"] += elapsed_ms
         _stats["latency_samples"]  += 1
+
+    # Update debug log entry with confirmed action
+    _push_debug({
+        "ts":          datetime.datetime.now().strftime("%H:%M:%S"),
+        "src_ip":      src_ip,
+        "pps":         round(_pps, 2),
+        "if_score":    round(if_score or 0.0, 4),
+        "threshold":   round(loader.if_threshold, 4) if loader._loaded else 0,
+        "is_anomaly":  True,
+        "attack_class": attack_class,
+        "confidence":  round((confidence or 0.0) * 100, 1),
+        "action":      action_taken,
+    })
 
     _push_sse_event({
         "timestamp":       ts,

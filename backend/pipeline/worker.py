@@ -42,7 +42,8 @@ def _process_item(src_ip: str, flow_stats: dict,
 
     is_syn_flagged   = syn_filter.is_flagged(src_ip)
     switch_delta_pps = float(flow_stats.get("switch_delta_pps", 0.0)) if flow_stats else 0.0
-    is_flood_switch  = switch_delta_pps >= 500.0
+    # Must match ryu_controller threshold (lowered from 500 → 80 for VM environments)
+    is_flood_switch  = switch_delta_pps >= 80.0
 
     # ── Baseline sensitivity fix (B2 + C1) ────────────────────────────────────
     # EXTRACTION_TRIGGER_S (2.0s) and EXTRACTION_TRIGGER_PKTS (10) were imported
@@ -109,6 +110,25 @@ def _process_item(src_ip: str, flow_stats: dict,
         if pre_flagged and if_score >= 0.58:
             is_anomaly = True
 
+        # ── Rand-source flood bypass ───────────────────────────────────────────
+        # Isolation Forest CANNOT detect rand-source attacks from per-flow features.
+        # Each rand-source flow: pkt_count=1, duration≈tiny → IF scores ~0.49
+        # (completely normal-looking single-packet flow). IF is blind to this type.
+        #
+        # The correct signal is switch_delta_pps — when it exceeds 500 the network
+        # is under a confirmed flood regardless of per-flow features. At that point
+        # we bypass IF and force is_anomaly=True so RF can classify the attack type.
+        #
+        # Threshold 500 (not 80):
+        #   80 = flood mode gate (submit to pipeline, bypass MIN_PPS)
+        #   500 = bypass IF gate (force anomaly — very high confidence of real flood)
+        # Baseline 12 hosts × 0.33 pps = ~4 pps total → never reaches 500.
+        # Real VM flood: sw_delta typically 300–2000+ pps → safely above 500.
+        if not is_anomaly and switch_delta_pps >= 500.0:
+            is_anomaly = True
+            log.debug("Rand-source bypass: %s  sw_delta=%.1f → forcing anomaly",
+                      src_ip, switch_delta_pps)
+
         attack_class = "Uncertain"
         confidence   = 0.0
 
@@ -116,7 +136,26 @@ def _process_item(src_ip: str, flow_stats: dict,
             rf_vec              = rf_pipeline.extract_rf_features(switch_stats)
             attack_class, confidence = rf_pipeline.run_rf_inference(rf_vec)
 
-        log.info("IF score for %s: %.4f  anomaly=%s", src_ip, if_score, is_anomaly)
+        # ── Diagnostic log — visible in backend terminal for every evaluated flow ──
+        pps_display = float(flow_stats.get("packet_count_per_second", 0.0)) if flow_stats else 0.0
+        sw_pps      = float(flow_stats.get("switch_delta_pps", 0.0)) if flow_stats else 0.0
+        conf_display = f"{confidence*100:.1f}%" if is_anomaly else "—"
+        log.info(
+            "[SCAN] %-15s  pps=%7.1f  sw_delta=%7.1f  IF=%.4f(thr=%.4f)  "
+            "anomaly=%-5s  RF=%-12s  conf=%s",
+            src_ip, pps_display, sw_pps, if_score, _effective_threshold,
+            str(is_anomaly), attack_class if is_anomaly else "—", conf_display
+        )
+        # Push to scan log buffer for /api/debug/flows endpoint
+        try:
+            from backend.pipeline.decision_engine import push_scan_result
+            push_scan_result(
+                src_ip, pps_display, sw_pps,
+                if_score, _effective_threshold, is_anomaly,
+                attack_class, confidence
+            )
+        except Exception:
+            pass
 
         if is_anomaly:
             tracker.set_cache(src_ip, if_score, is_anomaly, attack_class, confidence)

@@ -50,9 +50,17 @@ class FatTreeController(app_manager.RyuApp):
         })
 
         self._pkt_in_count: dict = collections.defaultdict(int)
-        self._pkt_in_ts:    dict = {}
+        # _pkt_in_ts removed — was initialized but never read or written anywhere.
 
         self._port_counts: dict = collections.defaultdict(int)
+
+        # PacketIn rate limiter — prevents controller overload during rand-source floods.
+        # Key: dpid → (count_in_window, window_start_monotonic)
+        # When PacketIn rate > PKT_IN_RATE_LIMIT/s, we forward without installing
+        # per-src-IP flow rules. This prevents 19M+ flow entries overwhelming OVS
+        # and Ryu's event loop crashing under --rand-source --flood attacks.
+        self._pkt_in_rate: dict = {}   # dpid → (count, window_start)
+        self._PKT_IN_RATE_LIMIT = 200  # PacketIn/s per switch before throttle
 
         hub.spawn(self._stats_poll_loop)
         hub.spawn(self._command_listener)
@@ -104,16 +112,95 @@ class FatTreeController(app_manager.RyuApp):
         ofp    = dp.ofproto
         parser = dp.ofproto_parser
         dpid   = dp.id
+        in_port = msg.match["in_port"]
 
+        # ── Rate limiter — MUST be FIRST, before any parsing ──────────────────
+        # Root cause of switch disconnections during rand-source flood:
+        # Old code checked the rate AFTER packet parsing, MAC learning, and ZMQ
+        # push. Every flood packet still triggered all that expensive processing
+        # → gevent event loop saturated → switches timed out and disconnected
+        # → FlowStats polling stopped → zero detections.
+        #
+        # Fix: check rate at the very top. If throttled, count the packet for
+        # rate_pkt_in (critical for flood detection) then forward immediately
+        # with zero other processing. This reduces per-packet cost from ~50μs
+        # to ~2μs for throttled packets, keeping the event loop healthy.
+        #
+        # ARP packets bypass throttling — they are low-volume and critical for
+        # connectivity. Only IPv4 flood packets are throttled.
+        now_mono    = time.monotonic()
+        _rate_entry = self._pkt_in_rate.get(dpid, (0, now_mono))
+        _rate_count, _rate_start = _rate_entry
+        if now_mono - _rate_start >= 1.0:
+            self._pkt_in_rate[dpid] = (1, now_mono)
+            _throttled = False
+        else:
+            _rate_count += 1
+            self._pkt_in_rate[dpid] = (_rate_count, _rate_start)
+            _throttled = (_rate_count > self._PKT_IN_RATE_LIMIT)
+
+        # Minimal fast-path for throttled IPv4 packets:
+        # Count for rate_pkt_in (flood signal), forward via flood, return.
+        # We check ethertype cheaply from the raw frame without full parsing.
+        if _throttled:
+            # Still count for rate_pkt_in — this is how switch_delta_pps
+            # detects the flood even when no flow rules are being installed.
+            self._pkt_in_count[dpid] += 1
+            # Forward: flood so the packet still reaches its destination.
+            # We don't know the dst MAC (no MAC learning at this rate), so
+            # flooding is the correct fallback. Legit traffic has flow rules
+            # already installed from warmup so it bypasses the controller.
+            actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
+            if msg.buffer_id != ofp.OFP_NO_BUFFER:
+                out = parser.OFPPacketOut(
+                    datapath=dp, buffer_id=msg.buffer_id,
+                    in_port=in_port, actions=actions, data=None)
+            else:
+                out = parser.OFPPacketOut(
+                    datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
+                    in_port=in_port, actions=actions, data=msg.data)
+            dp.send_msg(out)
+            return   # ← exit immediately, zero further processing
+
+        # ── Full processing path (not throttled) ───────────────────────────────
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
         if eth is None:
             return
 
-        ip4 = pkt.get_protocol(ipv4.ipv4)
-        if ip4 is None:
+        # ── ARP — must come before IPv4 check ─────────────────────────────────
+        if eth.ethertype == 0x0806:  # ARP
+            self._mac_to_port[dpid][eth.src] = in_port
+            actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
+            if msg.buffer_id != ofp.OFP_NO_BUFFER:
+                out = parser.OFPPacketOut(
+                    datapath=dp, buffer_id=msg.buffer_id,
+                    in_port=in_port, actions=actions, data=None)
+            else:
+                out = parser.OFPPacketOut(
+                    datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
+                    in_port=in_port, actions=actions, data=msg.data)
+            dp.send_msg(out)
             return
 
+        # ── Non-ARP, non-IPv4 (LLDP, IPv6 etc.) ──────────────────────────────
+        ip4 = pkt.get_protocol(ipv4.ipv4)
+        if ip4 is None:
+            self._mac_to_port[dpid][eth.src] = in_port
+            if eth.dst not in self._mac_to_port[dpid]:
+                actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
+                if msg.buffer_id != ofp.OFP_NO_BUFFER:
+                    out = parser.OFPPacketOut(
+                        datapath=dp, buffer_id=msg.buffer_id,
+                        in_port=in_port, actions=actions, data=None)
+                else:
+                    out = parser.OFPPacketOut(
+                        datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
+                        in_port=in_port, actions=actions, data=msg.data)
+                dp.send_msg(out)
+            return
+
+        # ── IPv4 full processing ───────────────────────────────────────────────
         src_ip = ip4.src
         dst_ip = ip4.dst
 
@@ -125,8 +212,10 @@ class FatTreeController(app_manager.RyuApp):
         tcp_flags_syn = bool(tcp_pkt and (tcp_pkt.bits & 0x02))
         tcp_flags_ack = bool(tcp_pkt and (tcp_pkt.bits & 0x10))
 
+        # Count for rate_pkt_in
         self._pkt_in_count[dpid] += 1
 
+        # Push telemetry for SYN tracking and packet_in events
         self._push({
             "type":          "packet_in",
             "dpid":          dpid,
@@ -138,7 +227,6 @@ class FatTreeController(app_manager.RyuApp):
             "ts":            time.time(),
         })
 
-        in_port = msg.match["in_port"]
         self._mac_to_port[dpid][eth.src] = in_port
 
         if eth.dst in self._mac_to_port[dpid]:
@@ -148,17 +236,14 @@ class FatTreeController(app_manager.RyuApp):
 
         actions = [parser.OFPActionOutput(out_port)]
 
+        # Install flow rule (with ipv4_src for per-IP FlowStats detection)
         if out_port != ofp.OFPP_FLOOD:
-            if ip4:
-                match = parser.OFPMatch(
-                    in_port=in_port,
-                    eth_type=0x0800,
-                    ipv4_src=src_ip,
-                    eth_dst=eth.dst,
-                )
-            else:
-                match = parser.OFPMatch(in_port=in_port, eth_dst=eth.dst)
-
+            match = parser.OFPMatch(
+                in_port=in_port,
+                eth_type=0x0800,
+                ipv4_src=src_ip,   # REQUIRED for per-IP telemetry in FlowStats
+                eth_dst=eth.dst,
+            )
             inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
             if msg.buffer_id != ofp.OFP_NO_BUFFER:
                 mod = parser.OFPFlowMod(
@@ -207,20 +292,31 @@ class FatTreeController(app_manager.RyuApp):
         dst_ips    = set()
         src_ips    = set()
 
+        # ── Bug 1 fix: compute rate_pkt_in BEFORE the per-flow loop ─────────────
+        # rate_pkt_in counts ALL PacketIn events this interval, including throttled
+        # rand-source packets that have NO OVS flow rule installed.
+        # The old code computed it AFTER the loop → the flood gate inside the loop
+        # never saw it → switch_delta_pps based only on flow table entries (which
+        # excluded throttled packets) → is_flood_switch stayed False → all
+        # rand-source flows filtered by pkt_count >= 50 gate → zero detections.
+        _rate_pkt_in_now = self._pkt_in_count.get(dpid, 0) / max(interval, 0.001)
+        self._pkt_in_count[dpid] = 0   # reset immediately after reading
+
         _sw_total_now = sum(s.packet_count for s in body)
         _prev_entry   = self._switch_prev_total.get(dpid)
         if _prev_entry is None:
-            self._switch_prev_total[dpid] = (_sw_total_now, False)
+            # First poll — record baseline, skip this delta (no prev to diff against)
+            self._switch_prev_total[dpid] = _sw_total_now
             agg["switch_delta_pps"] = 0.0
         else:
-            _sw_prev, _initialized = _prev_entry
-            if not _initialized:
-                self._switch_prev_total[dpid] = (_sw_total_now, True)
-                agg["switch_delta_pps"] = 0.0
-            else:
-                _sw_delta = max(_sw_total_now - _sw_prev, 0)
-                self._switch_prev_total[dpid] = (_sw_total_now, True)
-                agg["switch_delta_pps"] = _sw_delta / max(interval, 0.1)
+            _sw_delta = max(_sw_total_now - _prev_entry, 0)
+            self._switch_prev_total[dpid] = _sw_total_now
+            _flow_based_delta_pps = _sw_delta / max(interval, 0.1)
+            # Use the HIGHER of flow-table delta and PacketIn rate.
+            # During throttled rand-source flood: flow delta is low (only ~500
+            # rules installed), but rate_pkt_in captures all events including
+            # the millions of throttled packets → correctly signals flood mode.
+            agg["switch_delta_pps"] = max(_flow_based_delta_pps, _rate_pkt_in_now)
 
         for stat in body:
             total_pkt  += stat.packet_count
@@ -246,12 +342,20 @@ class FatTreeController(app_manager.RyuApp):
                 continue
 
             switch_delta_pps = agg.get("switch_delta_pps", 0.0)
-            is_flood_switch  = switch_delta_pps >= 500.0
+            # Threshold lowered from 500 → 80 for Mininet VM environments.
+            # In a VM, hping3 --flood achieves 50–500 pps (not 10,000+ like hardware).
+            # 80 safely separates flood (200+ pps) from baseline (< 5 pps total).
+            is_flood_switch  = switch_delta_pps >= 80.0
 
             if is_flood_switch:
+                # Flood mode: submit every flow with >= 1 pkt (catches rand-source).
+                # rand-source attacks: each flow has pkt_count=1 and unique src IP.
+                # They ONLY reach the backend via flood mode — non-flood gate
+                # requires pkt_count >= 50 which rand-source flows never reach.
                 if stat.packet_count < 1:
                     continue
             else:
+                # Normal mode: require accumulated evidence before submitting.
                 if stat.packet_count < 50 or pps < 5.0:
                     continue
 
@@ -284,9 +388,9 @@ class FatTreeController(app_manager.RyuApp):
         agg["avg_flow_dst"] = len(dst_ips)
         agg["avg_durat"]    = (sum(durations) / n_flows) if durations else 0.0
 
-        rate_pkt_in = self._pkt_in_count.get(dpid, 0) / interval
-        self._pkt_in_count[dpid] = 0
-        agg["rate_pkt_in"]  = rate_pkt_in
+        # rate_pkt_in was already computed and reset BEFORE the per-flow loop
+        # (Bug 1 fix). Store the value we already computed for RF feature use.
+        agg["rate_pkt_in"] = _rate_pkt_in_now
 
     # ------------------------------------------------------------------
     # PortStats reply

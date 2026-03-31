@@ -1,5 +1,5 @@
 from flask import Blueprint, jsonify
-from backend.pipeline.decision_engine import get_stats
+from backend.pipeline.decision_engine import get_stats, get_scan_log
 from backend.transport.zmq_receiver import get_raw_counts
 from backend.models import loader
 
@@ -54,3 +54,15 @@ def model_info():
         "rf_features":  loader.rf_features,
         "rf_classes":   loader.rf_classes,
     })
+
+
+@bp.get("/api/debug/flows")
+def debug_flows():
+    """Last 200 flow evaluations — shows IF score, PPS, RF class, confidence.
+
+    Use this during an attack to verify the pipeline is running and see
+    exactly what scores each IP is getting.  Refreshes every 2s from the
+    frontend or poll manually with:
+        curl http://127.0.0.1:5000/api/debug/flows | python3 -m json.tool
+    """
+    return jsonify(get_scan_log())
