@@ -288,3 +288,57 @@ def start_flush_thread() -> None:
 
     t = threading.Thread(target=_loop, name="summary-flush", daemon=True)
     t.start()
+
+# ---------------------------------------------------------------------------
+# ip_attack_history — one record per IP per attack session
+# ---------------------------------------------------------------------------
+
+def log_attack_history(src_ip: str, attack_vector: str, if_score: float,
+                       confidence: float, priority: str, phase_reached: int,
+                       first_seen: str, unblock_reason: str) -> None:
+    """Write a completed attack session to ip_attack_history.
+
+    Called by state_machine._clear() (TTL expiry) and manual_release().
+    first_seen: ISO timestamp when IP entered phase 1.
+    unblock_reason: 'TTL Expired' | 'Manual Release' | 'Manual Block Escalation'
+    """
+    unblocked_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        first_dt   = datetime.datetime.strptime(first_seen, "%Y-%m-%d %H:%M:%S")
+        last_dt    = datetime.datetime.strptime(unblocked_at, "%Y-%m-%d %H:%M:%S")
+        duration_s = int((last_dt - first_dt).total_seconds())
+    except Exception:
+        duration_s = 0
+
+    try:
+        execute("""
+            INSERT INTO ip_attack_history
+                (src_ip, attack_vector, if_score, confidence, priority,
+                 phase_reached, first_seen, unblocked_at, duration_sec, unblock_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            src_ip,
+            attack_vector,
+            round(if_score, 6),
+            round(confidence, 6),
+            priority,
+            phase_reached,
+            first_seen,
+            unblocked_at,
+            duration_s,
+            unblock_reason,
+        ))
+    except Exception:
+        log.exception("Failed to write attack history for %s", src_ip)
+
+
+def get_history_dates() -> list[str]:
+    """Return distinct dates (YYYY-MM-DD) that have attack history records."""
+    try:
+        rows = query(
+            "SELECT DISTINCT date(unblocked_at) AS d FROM ip_attack_history ORDER BY d ASC"
+        )
+        return [r["d"] for r in rows if r["d"]]
+    except Exception:
+        log.exception("Failed to get history dates")
+        return []

@@ -7,6 +7,46 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
 <link rel="stylesheet" href="/static/style.css"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+/* ── Modal sizing ── */
+.modal{min-width:620px;max-width:720px}
+
+/* ── Date input row ── */
+.date-field{display:flex;flex-direction:column;gap:6px;flex:1}
+.date-field label{font-size:11px;color:var(--sub,#5c6080);letter-spacing:.05em;font-family:var(--mono,'Space Mono',monospace)}
+.date-input-row{display:flex;gap:6px;align-items:center}
+.date-text-input{flex:1;background:var(--card,#13162a);border:1px solid var(--border,#1e2235);border-radius:8px;padding:8px 12px;color:var(--fg,#e8eaf6);font-family:var(--mono,'Space Mono',monospace);font-size:13px;outline:none}
+.date-text-input:focus{border-color:var(--blue,#3d6cff)}
+.cal-toggle-btn{background:var(--card,#13162a);border:1px solid var(--border,#1e2235);border-radius:8px;padding:8px 10px;cursor:pointer;color:var(--sub,#5c6080);font-size:16px;transition:color .15s,border-color .15s}
+.cal-toggle-btn:hover{color:var(--blue,#3d6cff);border-color:var(--blue,#3d6cff)}
+
+/* ── Calendar dropdown ── */
+.cal-dropdown{position:relative;display:inline-block}
+.cal-popup{display:none;position:absolute;top:calc(100% + 6px);left:0;z-index:999;
+  background:var(--card,#13162a);border:1px solid var(--border,#1e2235);
+  border-radius:12px;padding:14px;width:290px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+.cal-popup.open{display:block}
+.cal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.cal-month-label{font-size:13px;font-family:var(--mono,'Space Mono',monospace);color:var(--fg,#e8eaf6);font-weight:700}
+.cal-nav{background:none;border:none;color:var(--sub,#5c6080);font-size:22px;cursor:pointer;padding:0 6px;line-height:1;border-radius:6px}
+.cal-nav:hover{color:var(--fg,#e8eaf6);background:var(--border,#1e2235)}
+.cal-weekdays{display:grid;grid-template-columns:repeat(7,1fr);margin-bottom:4px}
+.cal-weekdays span{text-align:center;font-size:10px;color:var(--sub,#5c6080);font-family:var(--mono,'Space Mono',monospace);padding:3px 0}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
+.cal-day{text-align:center;font-size:12px;font-family:var(--mono,'Space Mono',monospace);
+  padding:7px 2px;border-radius:7px;cursor:pointer;color:var(--fg,#e8eaf6);position:relative;transition:background .1s}
+.cal-day:hover:not(.cal-disabled):not(.cal-empty){background:var(--blue,#3d6cff);color:#fff}
+.cal-day.cal-selected{background:var(--blue,#3d6cff);color:#fff;font-weight:700}
+.cal-day.cal-has-data::after{content:'';position:absolute;bottom:3px;left:50%;
+  transform:translateX(-50%);width:4px;height:4px;border-radius:50%;background:var(--green,#00d68f)}
+.cal-day.cal-selected.cal-has-data::after{background:#fff}
+.cal-day.cal-disabled{color:var(--sub2,#3a3f58);cursor:not-allowed;pointer-events:none}
+.cal-day.cal-empty{pointer-events:none}
+.cal-day.cal-today{border:1px solid var(--blue,#3d6cff)}
+.cal-legend{display:flex;align-items:center;gap:6px;margin-top:10px;font-size:10px;
+  color:var(--sub,#5c6080);font-family:var(--mono,'Space Mono',monospace)}
+.cal-legend-dot{width:6px;height:6px;border-radius:50%;background:var(--green,#00d68f);flex-shrink:0}
+</style>
 </head>
 <body>
 <div id="app">
@@ -161,9 +201,52 @@
 <div class="overlay" id="modal">
   <div class="modal">
     <h2>Generate Report</h2>
-    <div class="modal-row">
-      <div><label>Start Date</label><input type="date" id="r-start"/></div>
-      <div><label>End Date</label><input type="date" id="r-end"/></div>
+    <div class="modal-row" style="gap:20px;align-items:flex-start">
+
+      <!-- Start Date -->
+      <div class="date-field">
+        <label>START DATE</label>
+        <div class="date-input-row">
+          <input class="date-text-input" id="r-start" placeholder="YYYY-MM-DD"
+                 oninput="onDateType('start',this.value)"/>
+          <div class="cal-dropdown" id="drop-start">
+            <button class="cal-toggle-btn" onclick="toggleCal('start')" title="Pick date">📅</button>
+            <div class="cal-popup" id="cal-start-popup">
+              <div class="cal-header">
+                <button class="cal-nav" onclick="calNav('start',-1)">&#8249;</button>
+                <span class="cal-month-label" id="cal-start-label">—</span>
+                <button class="cal-nav" onclick="calNav('start',1)">&#8250;</button>
+              </div>
+              <div class="cal-weekdays"><span>Su</span><span>Mo</span><span>Tu</span><span>We</span><span>Th</span><span>Fr</span><span>Sa</span></div>
+              <div class="cal-grid" id="cal-start-grid"></div>
+              <div class="cal-legend"><div class="cal-legend-dot"></div>Has attack data</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- End Date -->
+      <div class="date-field">
+        <label>END DATE</label>
+        <div class="date-input-row">
+          <input class="date-text-input" id="r-end" placeholder="YYYY-MM-DD"
+                 oninput="onDateType('end',this.value)"/>
+          <div class="cal-dropdown" id="drop-end">
+            <button class="cal-toggle-btn" onclick="toggleCal('end')" title="Pick date">📅</button>
+            <div class="cal-popup" id="cal-end-popup">
+              <div class="cal-header">
+                <button class="cal-nav" onclick="calNav('end',-1)">&#8249;</button>
+                <span class="cal-month-label" id="cal-end-label">—</span>
+                <button class="cal-nav" onclick="calNav('end',1)">&#8250;</button>
+              </div>
+              <div class="cal-weekdays"><span>Su</span><span>Mo</span><span>Tu</span><span>We</span><span>Th</span><span>Fr</span><span>Sa</span></div>
+              <div class="cal-grid" id="cal-end-grid"></div>
+              <div class="cal-legend"><div class="cal-legend-dot"></div>Has attack data</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
     </div>
     <div class="modal-err" id="m-err"></div>
     <div class="modal-actions">

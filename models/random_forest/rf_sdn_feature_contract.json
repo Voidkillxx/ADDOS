@@ -12,6 +12,7 @@
     "g_usip",
     "rfip",
     "gsp",
+    "ip_proto",
     "flow_duration_total_ns",
     "bytes_per_packet",
     "pkt_byte_rate_ratio",
@@ -24,7 +25,7 @@
     "mean_byte_raw",
     "pkt_size_bucket"
   ],
-  "n_features": 23,
+  "n_features": 24,
   "class_names": [
     "ICMP Flood",
     "SYN Flood",
@@ -49,7 +50,7 @@
     "mean_byte_raw",
     "pkt_size_bucket"
   ],
-  "confidence_gate": 0.65,
-  "note": "3-class RF: ICMP Flood, SYN Flood, UDP Flood. SDN_DDOS_dataset.csv excluded (duplicate of individual CSVs). Unknown/zero-day attacks handled by confidence gate: if rf_conf < 0.55 \u2192 report as 'Uncertain'.",
+  "confidence_gate": 0.55,
+  "note": "3-class RF: ICMP Flood, SYN Flood, UDP Flood. SDN_DDOS_dataset.csv excluded (duplicate of individual CSVs). ip_proto injected from filename at train time (ICMP=1,TCP=6,UDP=17); at inference time supply real ip_proto from flow. avg_durat is in nanoseconds. ryu_controller.py computes dur_ns = sec*1e9 + nsec and sends it directly. rf_pipeline.py uses the value as-is with no conversion. Unknown/zero-day attacks handled by confidence gate: if rf_conf < 0.55 \u2192 report as 'Uncertain'.",
   "usage": "import joblib; model=joblib.load('random_forest_sdn_final.pkl'); scaler=joblib.load('scaler.pkl'); le=joblib.load('label_encoder.pkl'); proba=model.predict_proba(scaler.transform(X)); pred=le.inverse_transform(proba.argmax(axis=1)); conf=proba.max(axis=1); final=[p if c>=0.55 else 'Uncertain' for p,c in zip(pred,conf)]"
 }

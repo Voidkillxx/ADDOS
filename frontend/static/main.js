@@ -11,6 +11,8 @@ let range  = 'Live';
 let prev   = { t: 0, m: 0, n: 0 };
 let ifThr  = 0;
 let logCt  = 0;
+// Bug 3 fix: track log rows by src_ip — update in-place instead of duplicating
+const _logRows = new Map(); // src_ip → <tr> element
 
 // ── Chart ─────────────────────────────────────────────────────────────────────
 const chart = new Chart(document.getElementById('chart').getContext('2d'), {
@@ -120,39 +122,45 @@ async function fetchModelInfo() {
 }
 
 // ── Quarantine polling ────────────────────────────────────────────────────────
+// Bug 3 fix: DOM-diff the watchlist — update existing rows in-place instead of
+// wiping and re-rendering the whole table every poll. This prevents IP rows
+// from flashing/jumping and removes the visual duplicate problem.
+const _qRows = new Map(); // src_ip → <tr> element
+
 async function fetchQuarantine() {
   try {
     const data = await apiFetch('/api/quarantine_list');
     set('q-ct', `${data.length} IP${data.length !== 1 ? 's' : ''}`);
     const tb = document.getElementById('q-body');
+
     if (!data.length) {
+      _qRows.clear();
       tb.innerHTML = `<tr><td colspan="7" class="q-empty">No IPs currently under active mitigation.</td></tr>`;
       return;
     }
-    tb.innerHTML = data.map(e => {
+
+    const activeIps = new Set(data.map(e => e.src_ip));
+
+    // Remove rows no longer in list
+    for (const [ip, tr] of _qRows) {
+      if (!activeIps.has(ip)) { tr.remove(); _qRows.delete(ip); }
+    }
+
+    // Update or insert rows
+    data.forEach(e => {
       const sc  = e.if_score || 0;
       const ts  = e.time_in_phase_sec || 0;
-
-      // L15 fix: to_api_dict() in state_machine.py returns confidence already
-      // formatted as a string like "68.1%".  The old code had:
-      //   typeof e.confidence === 'number' ? `${(e.confidence*100).toFixed(1)}%` : e.confidence
-      // The number branch was always false (typeof "68.1%" === 'string'), so
-      // the formatted string was silently used as-is anyway — but the branch
-      // was dead code and masked the actual type contract.  Fixed: use the
-      // string directly since state_machine guarantees the format.
-      const conf   = e.confidence || '—';
-      const time   = ts < 60 ? `${ts}s` : `${Math.floor(ts / 60)}m ${ts % 60}s`;
-      const scCls  = !ifThr ? 'mono'
-                   : sc >= ifThr * 1.2 ? 'sc-red'
-                   : sc >= ifThr       ? 'sc-amb'
-                   : 'sc-grn';
-
-      // Show TTL remaining if present (Feature 1 — auto-block expiry)
+      const conf = e.confidence || '—';
+      const time = ts < 60 ? `${ts}s` : `${Math.floor(ts / 60)}m ${ts % 60}s`;
+      const scCls = !ifThr ? 'mono'
+                  : sc >= ifThr * 1.2 ? 'sc-red'
+                  : sc >= ifThr       ? 'sc-amb'
+                  : 'sc-grn';
       const ttlRemaining = e.ttl_remaining_sec != null
         ? ` <span style="color:var(--sub);font-size:10px;font-family:var(--mono)">[TTL ${Math.floor(e.ttl_remaining_sec / 60)}m]</span>`
         : '';
 
-      return `<tr>
+      const inner = `
         <td class="ip">${e.src_ip || '—'}</td>
         <td style="color:var(--sub2);font-size:11px">${e.phase || '—'}${ttlRemaining}</td>
         <td>${renderVector(e.attack_vector || '—')}</td>
@@ -162,9 +170,23 @@ async function fetchQuarantine() {
         <td><div style="display:flex;gap:6px">
           <button class="q-btn q-rel" onclick="quarantineAction('release','${e.src_ip}')">Release</button>
           <button class="q-btn q-blk" onclick="quarantineAction('block','${e.src_ip}')">Block Now</button>
-        </div></td>
-      </tr>`;
-    }).join('');
+        </div></td>`;
+
+      if (_qRows.has(e.src_ip)) {
+        // Update stats in-place — no flicker, no duplicate
+        _qRows.get(e.src_ip).innerHTML = inner;
+      } else {
+        const tr = document.createElement('tr');
+        tr.innerHTML = inner;
+        _qRows.set(e.src_ip, tr);
+        tb.appendChild(tr);
+      }
+    });
+
+    // Remove empty placeholder if present
+    const placeholder = tb.querySelector('[colspan]');
+    if (placeholder) placeholder.parentElement.remove();
+
   } catch (_) {}
 }
 
@@ -206,24 +228,46 @@ function addLogRow(ev) {
   const placeholder = tb.querySelector('[colspan]');
   if (placeholder) placeholder.parentElement.remove();
 
-  if (logCt >= MAX_LOG) {
-    const oldest = tb.querySelector('tr');
-    if (oldest) oldest.remove();
-  } else {
-    logCt++;
-  }
-  set('log-ct', logCt.toString());
-
-  const tr      = document.createElement('tr');
-  tr.className  = 'row-in';
-  tr.innerHTML  = `
+  const ip      = ev.src_ip || '—';
+  const html    = `
     <td class="mono">${ev.timestamp      || '—'}</td>
-    <td class="ip">${ev.src_ip           || '—'}</td>
+    <td class="ip">${ip}</td>
     <td>${renderClass(ev.predicted_class || '—')}</td>
     <td>${renderVector(ev.attack_vector  || '—')}</td>
     <td class="mono">${ev.confidence     || '—'}</td>
     <td>${renderPriority(ev.priority     || 'Low')}</td>
     <td>${renderAction(ev.action_taken   || '—')}</td>`;
+
+  // Bug 3 fix: if this IP already has a row, update it in-place (no duplicate)
+  if (_logRows.has(ip)) {
+    const existing = _logRows.get(ip);
+    existing.innerHTML = html;
+    existing.classList.remove('row-in');
+    void existing.offsetWidth; // reflow to restart animation
+    existing.classList.add('row-in');
+    // Move to top
+    tb.insertBefore(existing, tb.firstChild);
+    set('log-ct', logCt.toString());
+    return;
+  }
+
+  // New IP — add row
+  if (logCt >= MAX_LOG) {
+    const oldest = tb.querySelector('tr:last-child');
+    if (oldest) {
+      const oldIp = oldest.querySelector('.ip');
+      if (oldIp) _logRows.delete(oldIp.textContent);
+      oldest.remove();
+    }
+  } else {
+    logCt++;
+  }
+  set('log-ct', logCt.toString());
+
+  const tr     = document.createElement('tr');
+  tr.className = 'row-in';
+  tr.innerHTML = html;
+  _logRows.set(ip, tr);
   tb.insertBefore(tr, tb.firstChild);
 }
 
@@ -366,3 +410,131 @@ setInterval(fetchStats,      POLL_MS);
 setInterval(fetchQuarantine, POLL_MS);
 // fetchModelInfo is intentionally absent from setInterval —
 // model config is static for the lifetime of the backend process.
+
+// ── Calendar widget ───────────────────────────────────────────────────────────
+// Text input (type YYYY-MM-DD) + 📅 button that opens a popup calendar.
+// Future dates always disabled. Dates without history data disabled + no dot.
+// Dates with data show green dot. Today gets blue border.
+
+let _calDates = new Set();
+let _calState = {
+  start: { year: 0, month: 0, selected: '' },
+  end:   { year: 0, month: 0, selected: '' },
+};
+
+async function _loadHistoryDates() {
+  try {
+    const r = await apiFetch('/api/history_dates');
+    _calDates = new Set(r.dates || []);
+  } catch (_) { _calDates = new Set(); }
+}
+
+function _isoDate(dt) {
+  return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+}
+
+function _renderCal(which) {
+  const s      = _calState[which];
+  const today  = new Date();
+  const todayS = _isoDate(today);
+  const grid   = document.getElementById(`cal-${which}-grid`);
+  const label  = document.getElementById(`cal-${which}-label`);
+  if (!grid || !label) return;
+
+  const monthNames = ['January','February','March','April','May','June',
+                      'July','August','September','October','November','December'];
+  label.textContent = `${monthNames[s.month]} ${s.year}`;
+
+  const first  = new Date(s.year, s.month, 1).getDay();
+  const daysIn = new Date(s.year, s.month + 1, 0).getDate();
+
+  let html = '';
+  for (let i = 0; i < first; i++) html += `<div class="cal-day cal-empty"></div>`;
+
+  for (let d = 1; d <= daysIn; d++) {
+    const ds      = _isoDate(new Date(s.year, s.month, d));
+    const isFut   = ds > todayS;
+    const hasData = _calDates.has(ds);
+    const isSel   = ds === s.selected;
+    const isToday = ds === todayS;
+    const disabled = isFut || !hasData;
+
+    let cls = 'cal-day';
+    if (disabled) cls += ' cal-disabled';
+    if (hasData)  cls += ' cal-has-data';
+    if (isSel)    cls += ' cal-selected';
+    if (isToday)  cls += ' cal-today';
+
+    const click = disabled ? '' : `onclick="calSelect('${which}','${ds}')"`;
+    html += `<div class="${cls}" ${click}>${d}</div>`;
+  }
+  grid.innerHTML = html;
+}
+
+function calNav(which, dir) {
+  const s = _calState[which];
+  s.month += dir;
+  if (s.month > 11) { s.month = 0;  s.year++; }
+  if (s.month < 0)  { s.month = 11; s.year--; }
+  _renderCal(which);
+  event.stopPropagation();
+}
+
+function calSelect(which, ds) {
+  _calState[which].selected = ds;
+  document.getElementById(`r-${which}`).value = ds;
+  _renderCal(which);
+  // Close popup after selection
+  document.getElementById(`cal-${which}-popup`).classList.remove('open');
+}
+
+function toggleCal(which) {
+  const popup = document.getElementById(`cal-${which}-popup`);
+  const other  = which === 'start' ? 'end' : 'start';
+  document.getElementById(`cal-${other}-popup`).classList.remove('open');
+  popup.classList.toggle('open');
+  if (popup.classList.contains('open')) _renderCal(which);
+  event.stopPropagation();
+}
+
+// Close popups when clicking outside
+document.addEventListener('click', () => {
+  document.getElementById('cal-start-popup')?.classList.remove('open');
+  document.getElementById('cal-end-popup')?.classList.remove('open');
+});
+
+// Allow typing date directly into text input
+function onDateType(which, val) {
+  // Accepts YYYY-MM-DD format — validate and update calendar state
+  if (/^\d{4}-\d{2}-\d{2}$/.test(val)) {
+    const dt = new Date(val + 'T00:00:00');
+    if (!isNaN(dt)) {
+      _calState[which].year     = dt.getFullYear();
+      _calState[which].month    = dt.getMonth();
+      _calState[which].selected = val;
+      _renderCal(which);
+    }
+  }
+}
+
+function _initCals() {
+  const today    = new Date();
+  const lastWeek = new Date(today);
+  lastWeek.setDate(today.getDate() - 7);
+  _calState.start = { year: lastWeek.getFullYear(), month: lastWeek.getMonth(), selected: '' };
+  _calState.end   = { year: today.getFullYear(),    month: today.getMonth(),    selected: '' };
+  _renderCal('start');
+  _renderCal('end');
+}
+
+// Override openModal
+async function openModal() {
+  document.getElementById('m-err').textContent = '';
+  document.getElementById('r-start').value = '';
+  document.getElementById('r-end').value   = '';
+  _calState.start.selected = '';
+  _calState.end.selected   = '';
+  document.getElementById('modal').classList.add('open');
+  await _loadHistoryDates();
+  _initCals();
+}

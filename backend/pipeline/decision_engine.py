@@ -26,7 +26,7 @@ _sse_lock   = threading.Lock()
 _sse_buffer: collections.deque = collections.deque(maxlen=200)
 
 _sse_dedup: dict = {}
-_SSE_DEDUP_TTL = 5.0
+_SSE_DEDUP_TTL = 30.0  # Bug 3 fix: was 5s, too short for sustained attacks
 
 # ── Pending restores — IPs awaiting baseline traffic restart after manual release
 _restore_lock     = threading.Lock()

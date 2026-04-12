@@ -9,8 +9,18 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
 )
 from backend.database.db import query
+from backend.database import writer
 
 bp = Blueprint("report", __name__)
+
+
+@bp.get("/api/history_dates")
+def history_dates():
+    """Return list of YYYY-MM-DD dates that have attack history records.
+    Used by the calendar widget to disable dates with no data and future dates.
+    """
+    dates = writer.get_history_dates()
+    return jsonify({"dates": dates})
 
 
 def _validate_dates(body: dict) -> tuple[str, str, str | None]:
@@ -206,6 +216,54 @@ def _build_pdf(start_str: str, end_str: str, rows: list[dict]) -> bytes:
         ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
     ]))
     story.append(log_tbl)
+
+    # ── Section 3: IP Attack History ──────────────────────────────────────────
+    history_rows = query("""
+        SELECT src_ip, attack_vector, if_score, confidence, priority,
+               phase_reached, first_seen, unblocked_at, duration_sec, unblock_reason
+        FROM ip_attack_history
+        WHERE date(unblocked_at) >= ? AND date(unblocked_at) <= ?
+        ORDER BY unblocked_at DESC
+    """, (start_str, end_str))
+
+    if history_rows:
+        story.append(Spacer(1, 0.6*cm))
+        story.append(Paragraph("3. IP Attack History (Completed Sessions)", h1_style))
+
+        hist_headers = ["Source IP", "Vector", "IF Score", "Conf",
+                        "Phase", "Duration", "Unblocked At", "Reason"]
+        hist_data = [hist_headers]
+        for r in history_rows:
+            dur = r["duration_sec"] or 0
+            dur_str = f"{dur//60}m {dur%60}s" if dur >= 60 else f"{dur}s"
+            conf_pct = f"{r['confidence']*100:.1f}%" if r["confidence"] else "—"
+            hist_data.append([
+                r["src_ip"],
+                r["attack_vector"] or "—",
+                f"{r['if_score']:.4f}",
+                conf_pct,
+                f"Phase {r['phase_reached']}",
+                dur_str,
+                r["unblocked_at"],
+                r["unblock_reason"] or "—",
+            ])
+
+        hist_col_widths = [3*cm, 2.5*cm, 1.8*cm, 1.5*cm, 1.5*cm, 1.5*cm, 3.5*cm, 2.2*cm]
+        hist_tbl = Table(hist_data, colWidths=hist_col_widths, repeatRows=1)
+        hist_tbl.setStyle(TableStyle([
+            ("FONTNAME",      (0, 0), (-1, 0),  "Helvetica-Bold"),
+            ("FONTSIZE",      (0, 0), (-1, -1), 7.5),
+            ("FONTNAME",      (0, 1), (-1, -1), "Helvetica"),
+            ("BACKGROUND",    (0, 0), (-1, 0),  colors.HexColor("#1a1a21")),
+            ("TEXTCOLOR",     (0, 0), (-1, 0),  colors.white),
+            ("ROWBACKGROUNDS",(0, 1), (-1, -1),
+             [colors.HexColor("#f9fafb"), colors.white]),
+            ("GRID",          (0, 0), (-1, -1), 0.4, colors.HexColor("#e5e7eb")),
+            ("TOPPADDING",    (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(hist_tbl)
 
     doc.build(story)
     return buf.getvalue()

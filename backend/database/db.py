@@ -136,6 +136,30 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             block_expires_at TEXT
         );
 
+        -- ip_attack_history: one row per IP per attack session.
+        -- Written when an IP is unblocked (TTL expiry, manual release, or escalation).
+        -- Used for history view and report generation by date range.
+        CREATE TABLE IF NOT EXISTS ip_attack_history (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            src_ip          TEXT    NOT NULL,
+            attack_vector   TEXT    NOT NULL,
+            if_score        REAL    NOT NULL,
+            confidence      REAL    NOT NULL,
+            priority        TEXT    NOT NULL DEFAULT 'Low',
+            phase_reached   INTEGER NOT NULL DEFAULT 1,
+            first_seen      TEXT    NOT NULL,
+            unblocked_at    TEXT    NOT NULL,
+            duration_sec    INTEGER NOT NULL DEFAULT 0,
+            unblock_reason  TEXT    NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_history_ip
+            ON ip_attack_history (src_ip);
+        CREATE INDEX IF NOT EXISTS idx_history_unblocked
+            ON ip_attack_history (unblocked_at);
+        CREATE INDEX IF NOT EXISTS idx_history_date
+            ON ip_attack_history (date(unblocked_at));
+
         CREATE TABLE IF NOT EXISTS global_counters (
             id               INTEGER PRIMARY KEY CHECK (id = 1),
             total_packets    INTEGER NOT NULL DEFAULT 0,

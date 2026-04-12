@@ -202,10 +202,10 @@ def start_baseline_traffic(hosts: list) -> None:
 def launch_syn_flood(net, attacker_name="h1", victim_name="h2", duration=60):
     attacker = net.get(attacker_name)
     victim   = net.get(victim_name)
-    info(f"*** SYN Flood ({ATTACK_PKT_COUNT:,} pkts, rand-source): "
+    info(f"*** SYN Flood ({ATTACK_PKT_COUNT:,} pkts, fixed-src): "
          f"{attacker_name}({attacker.IP()}) → {victim_name}({victim.IP()})\n")
     attacker.cmd(
-        f"hping3 -S -p 80 --flood -c {ATTACK_PKT_COUNT} --rand-source {victim.IP()} "
+        f"hping3 -S -p 80 --flood -c {ATTACK_PKT_COUNT} {victim.IP()} "
         f"> /dev/null 2>&1 &"
     )
 
@@ -213,10 +213,10 @@ def launch_syn_flood(net, attacker_name="h1", victim_name="h2", duration=60):
 def launch_icmp_flood(net, attacker_name="h5", victim_name="h6", duration=60):
     attacker = net.get(attacker_name)
     victim   = net.get(victim_name)
-    info(f"*** ICMP Flood ({ATTACK_PKT_COUNT:,} pkts, rand-source): "
+    info(f"*** ICMP Flood ({ATTACK_PKT_COUNT:,} pkts, fixed-src): "
          f"{attacker_name}({attacker.IP()}) → {victim_name}({victim.IP()})\n")
     attacker.cmd(
-        f"hping3 --icmp --flood -c {ATTACK_PKT_COUNT} --rand-source {victim.IP()} "
+        f"hping3 --icmp --flood -c {ATTACK_PKT_COUNT} {victim.IP()} "
         f"> /dev/null 2>&1 &"
     )
 
@@ -224,10 +224,10 @@ def launch_icmp_flood(net, attacker_name="h5", victim_name="h6", duration=60):
 def launch_udp_flood(net, attacker_name="h9", victim_name="h10", duration=60):
     attacker = net.get(attacker_name)
     victim   = net.get(victim_name)
-    info(f"*** UDP Flood ({ATTACK_PKT_COUNT:,} pkts, rand-source): "
+    info(f"*** UDP Flood ({ATTACK_PKT_COUNT:,} pkts, fixed-src): "
          f"{attacker_name}({attacker.IP()}) → {victim_name}({victim.IP()})\n")
     attacker.cmd(
-        f"hping3 --udp -p 53 --flood -c {ATTACK_PKT_COUNT} --rand-source {victim.IP()} "
+        f"hping3 --udp -p 53 --flood -c {ATTACK_PKT_COUNT} {victim.IP()} "
         f"> /dev/null 2>&1 &"
     )
 
@@ -236,11 +236,11 @@ def launch_syn_flood_sustained(net, attacker_name="h1", victim_name="h2"):
     """Unlimited SYN flood — runs until stop_all_attacks(). Simulates persistent DDoS."""
     attacker = net.get(attacker_name)
     victim   = net.get(victim_name)
-    info(f"*** SYN Flood SUSTAINED (unlimited): "
+    info(f"*** SYN Flood SUSTAINED (unlimited, fixed-src): "
          f"{attacker_name}({attacker.IP()}) → {victim_name}({victim.IP()})\n")
     info("    → Use  py stop_all_attacks(net)  to stop.\n")
     attacker.cmd(
-        f"hping3 -S -p 80 --flood --rand-source -i u500 {victim.IP()} > /dev/null 2>&1 &"
+        f"hping3 -S -p 80 --flood -i u500 {victim.IP()} > /dev/null 2>&1 &"
     )
 
 
@@ -248,11 +248,11 @@ def launch_icmp_flood_sustained(net, attacker_name="h5", victim_name="h6"):
     """Unlimited ICMP flood — runs until stop_all_attacks(). Simulates persistent DDoS."""
     attacker = net.get(attacker_name)
     victim   = net.get(victim_name)
-    info(f"*** ICMP Flood SUSTAINED (unlimited): "
+    info(f"*** ICMP Flood SUSTAINED (unlimited, fixed-src): "
          f"{attacker_name}({attacker.IP()}) → {victim_name}({victim.IP()})\n")
     info("    → Use  py stop_all_attacks(net)  to stop.\n")
     attacker.cmd(
-        f"hping3 --icmp --flood --rand-source -i u500 {victim.IP()} > /dev/null 2>&1 &"
+        f"hping3 --icmp --flood -i u500 {victim.IP()} > /dev/null 2>&1 &"
     )
 
 
@@ -260,11 +260,11 @@ def launch_udp_flood_sustained(net, attacker_name="h9", victim_name="h10"):
     """Unlimited UDP flood — runs until stop_all_attacks(). Simulates persistent DDoS."""
     attacker = net.get(attacker_name)
     victim   = net.get(victim_name)
-    info(f"*** UDP Flood SUSTAINED (unlimited): "
+    info(f"*** UDP Flood SUSTAINED (unlimited, fixed-src): "
          f"{attacker_name}({attacker.IP()}) → {victim_name}({victim.IP()})\n")
     info("    → Use  py stop_all_attacks(net)  to stop.\n")
     attacker.cmd(
-        f"hping3 --udp -p 53 --flood --rand-source -i u500 {victim.IP()} > /dev/null 2>&1 &"
+        f"hping3 --udp -p 53 --flood -i u500 {victim.IP()} > /dev/null 2>&1 &"
     )
 
 
@@ -273,48 +273,48 @@ def launch_udp_flood_sustained(net, attacker_name="h9", victim_name="h10"):
 # ==================================================================
 
 def start_syn_flood_campaign(net):
-    info("*** [CAMPAIGN] SYN Flood — 4 attackers, unlimited, random sources\n")
+    info("*** [CAMPAIGN] SYN Flood — 4 attackers, unlimited, fixed IPs\n")
     for att, vic in _CAMPAIGNS:
         attacker = net.get(att)
         victim   = net.get(vic)
         info(f"    {att}({attacker.IP()}) → {vic}({victim.IP()})  [SYN --flood]\n")
         attacker.cmd(
-            f"hping3 -S -p 80 --flood --rand-source -i u500 {victim.IP()} > /dev/null 2>&1 &"
+            f"hping3 -S -p 80 --flood -i u500 {victim.IP()} > /dev/null 2>&1 &"
         )
     info("    → Running. Use  py stop_all_attacks(net)  to stop.\n")
 
 
 def start_icmp_flood_campaign(net):
-    info("*** [CAMPAIGN] ICMP Flood — 4 attackers, unlimited, random sources\n")
+    info("*** [CAMPAIGN] ICMP Flood — 4 attackers, unlimited, fixed IPs\n")
     for att, vic in _CAMPAIGNS:
         attacker = net.get(att)
         victim   = net.get(vic)
         info(f"    {att}({attacker.IP()}) → {vic}({victim.IP()})  [ICMP --flood]\n")
         attacker.cmd(
-            f"hping3 --icmp --flood --rand-source -i u500 {victim.IP()} > /dev/null 2>&1 &"
+            f"hping3 --icmp --flood -i u500 {victim.IP()} > /dev/null 2>&1 &"
         )
     info("    → Running. Use  py stop_all_attacks(net)  to stop.\n")
 
 
 def start_udp_flood_campaign(net):
-    info("*** [CAMPAIGN] UDP Flood — 4 attackers, unlimited, random sources\n")
+    info("*** [CAMPAIGN] UDP Flood — 4 attackers, unlimited, fixed IPs\n")
     for att, vic in _CAMPAIGNS:
         attacker = net.get(att)
         victim   = net.get(vic)
         info(f"    {att}({attacker.IP()}) → {vic}({victim.IP()})  [UDP --flood]\n")
         attacker.cmd(
-            f"hping3 --udp -p 53 --flood --rand-source -i u500 {victim.IP()} > /dev/null 2>&1 &"
+            f"hping3 --udp -p 53 --flood -i u500 {victim.IP()} > /dev/null 2>&1 &"
         )
     info("    → Running. Use  py stop_all_attacks(net)  to stop.\n")
 
 
 def start_mixed_campaign(net):
-    info("*** [CAMPAIGN] Mixed DDoS — SYN + ICMP + UDP simultaneously\n")
+    info("*** [CAMPAIGN] Mixed DDoS — SYN + ICMP + UDP simultaneously, fixed IPs\n")
     campaigns = [
-        ("h1",  "h2",  "hping3 -S -p 80 --flood --rand-source -i u500", "SYN Flood"),
-        ("h5",  "h6",  "hping3 --icmp --flood --rand-source -i u500",   "ICMP Flood"),
-        ("h9",  "h10", "hping3 --udp -p 53 --flood --rand-source -i u500", "UDP Flood"),
-        ("h13", "h14", "hping3 -S -p 443 --flood --rand-source -i u500", "SYN Flood (p443)"),
+        ("h1",  "h2",  "hping3 -S -p 80 --flood -i u500", "SYN Flood"),
+        ("h5",  "h6",  "hping3 --icmp --flood -i u500",   "ICMP Flood"),
+        ("h9",  "h10", "hping3 --udp -p 53 --flood -i u500", "UDP Flood"),
+        ("h13", "h14", "hping3 -S -p 443 --flood -i u500", "SYN Flood (p443)"),
     ]
     for att, vic, cmd_prefix, label in campaigns:
         attacker = net.get(att)

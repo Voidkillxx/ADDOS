@@ -40,6 +40,9 @@ class IpState:
     # The actual wall-clock expiry is persisted in quarantine_state.block_expires_at
     # so it survives backend restarts.  None = manual permanent block.
     ttl_expires_at: Optional[float] = None
+    # History fix: wall-clock time IP first entered phase 1 (for duration calc)
+    first_seen:     str   = field(default_factory=lambda: datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    priority:       str   = "Low"
 
     def phase_label(self) -> str:
         return PHASE_LABELS.get(self.phase, "Unknown")
@@ -177,6 +180,8 @@ class StateMachine:
                 if confidence < MIN_QUARANTINE_CONFIDENCE and attack_class == "Uncertain":
                     return "Skipped"
 
+                from backend.pipeline.decision_engine import _assign_priority as _ap
+                _prio = _ap(if_score, confidence)
                 state = IpState(
                     src_ip        = src_ip,
                     phase         = 1,
@@ -184,6 +189,7 @@ class StateMachine:
                     if_score      = if_score,
                     confidence    = confidence,
                     action_taken  = "Quarantined",
+                    priority      = _prio,
                 )
                 self._states[src_ip] = state
                 self._push_command(src_ip, "quarantine")
@@ -213,13 +219,13 @@ class StateMachine:
                 elif state.phase == 2 and elapsed >= PHASE2_DURATION:
                     self._advance(state, 3)
                 elif state.phase == 4 and elapsed >= PROBATION_DURATION:
-                    self._clear(src_ip)
+                    self._clear(src_ip, reason="Probation Complete")
                 # Feature 1 TTL expiry for auto-blocks
                 elif (state.phase == 3
                       and state.ttl_expires_at is not None
                       and now >= state.ttl_expires_at):
                     log.info("TTL expired for %s — auto-unblocking", src_ip)
-                    self._clear(src_ip)
+                    self._clear(src_ip, reason="TTL Expired")
 
     def _advance(self, state: IpState, new_phase: int) -> None:
         state.phase         = new_phase
@@ -243,11 +249,23 @@ class StateMachine:
                      state.src_ip, BLOCK_TTL_SECONDS, exp_str)
             self._persist(state, block_expires_at=exp_str)
 
-    def _clear(self, src_ip: str) -> None:
-        self._states.pop(src_ip, None)
+    def _clear(self, src_ip: str, reason: str = "TTL Expired") -> None:
+        state = self._states.pop(src_ip, None)
         self._push_command(src_ip, "clear")
         writer.delete_quarantine_state(src_ip)
-        log.info("Cleared: %s", src_ip)
+        # History fix: log completed attack session to ip_attack_history
+        if state is not None:
+            writer.log_attack_history(
+                src_ip        = src_ip,
+                attack_vector = state.attack_vector,
+                if_score      = state.if_score,
+                confidence    = state.confidence,
+                priority      = state.priority,
+                phase_reached = state.phase,
+                first_seen    = state.first_seen,
+                unblock_reason= reason,
+            )
+        log.info("Cleared: %s  reason=%s", src_ip, reason)
 
     # ------------------------------------------------------------------
     # Manual operator actions
@@ -257,10 +275,21 @@ class StateMachine:
         with self._lock:
             if src_ip not in self._states:
                 return False
-            self._states.pop(src_ip)
+            state = self._states.pop(src_ip)
         self._push_command(src_ip, "clear")
         writer.delete_quarantine_state(src_ip)
         writer.log_manual_action(src_ip, "manual_release")
+        # History fix: log session on manual release
+        writer.log_attack_history(
+            src_ip        = src_ip,
+            attack_vector = state.attack_vector,
+            if_score      = state.if_score,
+            confidence    = state.confidence,
+            priority      = state.priority,
+            phase_reached = state.phase,
+            first_seen    = state.first_seen,
+            unblock_reason= "Manual Release",
+        )
         log.info("Manual release: %s", src_ip)
         return True
 

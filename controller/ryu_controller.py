@@ -54,6 +54,12 @@ class FatTreeController(app_manager.RyuApp):
 
         self._port_counts: dict = collections.defaultdict(int)
 
+        # Track dominant ip_proto per switch per polling interval.
+        # Counts {dpid: {proto_num: count}} — reset each FlowStats reply.
+        # Injected into switch_stats as ip_proto for RF classification.
+        # ICMP=1, TCP/SYN=6, UDP=17  (matches FILENAME_PROTO_MAP in training)
+        self._switch_proto: dict = collections.defaultdict(lambda: collections.defaultdict(int))
+
         # PacketIn rate limiter — prevents controller overload during rand-source floods.
         # Key: dpid → (count_in_window, window_start_monotonic)
         # When PacketIn rate > PKT_IN_RATE_LIMIT/s, we forward without installing
@@ -215,6 +221,10 @@ class FatTreeController(app_manager.RyuApp):
         # Count for rate_pkt_in
         self._pkt_in_count[dpid] += 1
 
+        # Track protocol distribution per switch for RF ip_proto feature
+        if ip4.proto:
+            self._switch_proto[dpid][ip4.proto] += 1
+
         # Push telemetry for SYN tracking and packet_in events
         self._push({
             "type":          "packet_in",
@@ -285,6 +295,9 @@ class FatTreeController(app_manager.RyuApp):
         interval = (now - prev_ts) if prev_ts else 1.0
         agg["last_reply_ts"] = now
         agg["disp_interval"] = max(interval, 0.001)
+
+        # Reset proto counter each interval so dominant_proto reflects current traffic
+        self._switch_proto[dpid].clear()
 
         total_pkt  = 0
         total_byte = 0
@@ -359,6 +372,12 @@ class FatTreeController(app_manager.RyuApp):
                 if stat.packet_count < 50 or pps < 5.0:
                     continue
 
+            # ICMP fix: read ip_proto directly from OVS flow match per-flow.
+            # PacketIn-based counting always showed ICMP dominant in mixed
+            # campaigns because SYN/UDP get rules installed and stop hitting
+            # the controller. Flow match gives the real protocol per src_ip.
+            _flow_ip_proto = int(match.get("ip_proto", 0))
+
             self._push({
                 "type":       "flow_stats",
                 "dpid":       dpid,
@@ -376,6 +395,7 @@ class FatTreeController(app_manager.RyuApp):
                     "byte_count_per_second":    bps,
                     "byte_count_per_nsecond":   bpns,
                     "switch_delta_pps":         switch_delta_pps,
+                    "ip_proto":                 _flow_ip_proto,
                 },
                 "switch_stats": self._build_switch_stats(dpid),
             })
@@ -502,6 +522,15 @@ class FatTreeController(app_manager.RyuApp):
     def _build_switch_stats(self, dpid: int) -> dict:
         agg = self._switch_agg[dpid]
         n   = max(agg["gfe"], 1)
+
+        # Dominant ip_proto this interval: pick the protocol with most PacketIn events.
+        # Falls back to 0 if no IPv4 packets seen yet.
+        proto_counts = self._switch_proto.get(dpid, {})
+        if proto_counts:
+            dominant_proto = max(proto_counts, key=proto_counts.get)
+        else:
+            dominant_proto = 0
+
         return {
             "disp_pakt":     agg["disp_pakt"],
             "disp_byte":     agg["disp_byte"],
@@ -515,6 +544,7 @@ class FatTreeController(app_manager.RyuApp):
             "g_usip":        len(agg["g_usip"]),
             "rfip":          self._count_rfip(dpid),
             "gsp":           self._port_counts.get(dpid, 0),
+            "ip_proto":      dominant_proto,
         }
 
     def _count_rfip(self, dpid: int) -> int:

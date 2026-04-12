@@ -7,7 +7,7 @@ from backend.config import (
     EXTRACTION_TRIGGER_PKTS, EXTRACTION_TRIGGER_S,
     IF_SCORE_THRESHOLD_OVERRIDE, MIN_FLOW_PKTS_FOR_INFERENCE,
 )
-from backend.models import if_pipeline, rf_pipeline
+from backend.models import if_pipeline, rf_pipeline, loader, loader
 from backend.pipeline.flow_tracker import tracker
 from backend.pipeline.syn_prefilter import syn_filter
 
@@ -104,36 +104,42 @@ def _process_item(src_ip: str, flow_stats: dict,
 
         _effective_threshold = (IF_SCORE_THRESHOLD_OVERRIDE
                                 if IF_SCORE_THRESHOLD_OVERRIDE is not None
-                                else 0.72)
+                                else loader.if_threshold)  # Bug1 fix: use contract threshold not hardcoded 0.72
         is_anomaly = (if_score >= _effective_threshold)
 
         if pre_flagged and if_score >= 0.58:
             is_anomaly = True
 
         # ── Rand-source flood bypass ───────────────────────────────────────────
-        # Isolation Forest CANNOT detect rand-source attacks from per-flow features.
-        # Each rand-source flow: pkt_count=1, duration≈tiny → IF scores ~0.49
-        # (completely normal-looking single-packet flow). IF is blind to this type.
+        # Only bypass IF when BOTH conditions are met:
+        #   1. switch_delta_pps >= 1000 (undeniable flood — well above VM baseline)
+        #   2. if_score >= 0.50 (above noise floor — not a clearly normal flow)
         #
-        # The correct signal is switch_delta_pps — when it exceeds 500 the network
-        # is under a confirmed flood regardless of per-flow features. At that point
-        # we bypass IF and force is_anomaly=True so RF can classify the attack type.
+        # Rationale: without condition 2, a legitimately normal flow (IF score 0.44)
+        # on a switch that happens to be under flood gets force-quarantined even
+        # though IF correctly identified it as normal. The score floor ensures we
+        # only override IF when the score is at least ambiguous, not clearly benign.
         #
-        # Threshold 500 (not 80):
-        #   80 = flood mode gate (submit to pipeline, bypass MIN_PPS)
-        #   500 = bypass IF gate (force anomaly — very high confidence of real flood)
-        # Baseline 12 hosts × 0.33 pps = ~4 pps total → never reaches 500.
-        # Real VM flood: sw_delta typically 300–2000+ pps → safely above 500.
-        if not is_anomaly and switch_delta_pps >= 500.0:
+        # Threshold raised 500 → 1000: fixed-IP attacks accumulate packets in one
+        # flow so IF detects them normally. The bypass is now only a last-resort
+        # safety net for extreme floods where IF is structurally blind.
+        if not is_anomaly and switch_delta_pps >= 1000.0 and if_score >= 0.50:
             is_anomaly = True
-            log.debug("Rand-source bypass: %s  sw_delta=%.1f → forcing anomaly",
-                      src_ip, switch_delta_pps)
+            log.debug("Flood bypass: %s  sw_delta=%.1f  IF=%.4f → forcing anomaly",
+                      src_ip, switch_delta_pps, if_score)
 
         attack_class = "Uncertain"
         confidence   = 0.0
 
         if is_anomaly:
-            rf_vec              = rf_pipeline.extract_rf_features(switch_stats)
+            # ICMP bug fix: ip_proto is per-flow (from OVS flow match),
+            # stored in flow_stats. RF reads it from switch_stats["ip_proto"].
+            # Inject it so RF gets the actual protocol, not the switch default.
+            rf_switch = dict(switch_stats) if switch_stats else {}
+            _flow_proto = int((flow_stats or {}).get("ip_proto", 0))
+            if _flow_proto:
+                rf_switch["ip_proto"] = _flow_proto
+            rf_vec              = rf_pipeline.extract_rf_features(rf_switch)
             attack_class, confidence = rf_pipeline.run_rf_inference(rf_vec)
 
         # ── Diagnostic log — visible in backend terminal for every evaluated flow ──
