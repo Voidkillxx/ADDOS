@@ -42,8 +42,8 @@ def _process_item(src_ip: str, flow_stats: dict,
 
     is_syn_flagged   = syn_filter.is_flagged(src_ip)
     switch_delta_pps = float(flow_stats.get("switch_delta_pps", 0.0)) if flow_stats else 0.0
-    # Must match ryu_controller threshold (lowered from 500 → 80 for VM environments)
-    is_flood_switch  = switch_delta_pps >= 80.0
+    # Must match ryu_controller threshold (lowered to 20 for faster VM detection)
+    is_flood_switch  = switch_delta_pps >= 20.0
 
     # ── Baseline sensitivity fix (B2 + C1) ────────────────────────────────────
     # EXTRACTION_TRIGGER_S (2.0s) and EXTRACTION_TRIGGER_PKTS (10) were imported
@@ -73,9 +73,14 @@ def _process_item(src_ip: str, flow_stats: dict,
             tracker.invalidate_cache(src_ip)
             return
 
-    # Non-flood low-rate gate (unchanged from original)
-    if not is_flood_switch and pps < 5.0 and not is_syn_flagged:
-        tracker.invalidate_cache(src_ip)
+    # Non-flood low-rate gate — report as normal traffic so UI counters
+    # (Normal Traffic, Forwarded) increment during baseline-only periods.
+    # No ML inference runs — IF/RF are skipped entirely, zero FP risk.
+    if not is_flood_switch and pps < 1.0 and not is_syn_flagged:
+        if _result_callback:
+            _result_callback(src_ip, 0.0, False, "Normal", 0.0,
+                             flow_stats=flow_stats, switch_stats=switch_stats,
+                             timed_out=False)
         return
 
     if time.monotonic() - enqueued_at > WORKER_ITEM_TIMEOUT_S:
@@ -85,16 +90,47 @@ def _process_item(src_ip: str, flow_stats: dict,
         return
 
     cached = tracker.get_cached(src_ip)
+    _prior_class = None
+    _prior_conf  = 0.0
     if cached:
-        if _result_callback:
-            _result_callback(
-                src_ip,
-                cached.if_score, cached.is_anomaly,
-                cached.attack_class, cached.confidence,
-                flow_stats=flow_stats, switch_stats=switch_stats,
-                timed_out=False,
-            )
-        return
+        # F6 fix: lock threshold lowered from 75% to 70% per user requirement.
+        # Attack vector locking logic:
+        #   - confidence >= 0.70 AND attack_class is a real type (not Uncertain)
+        #     → LOCKED forever — never re-run RF, prevents label flipping in
+        #       mixed campaigns where switch aggregate stats are polluted by
+        #       multiple attack types on the same switch.
+        #   - already in Phase 2/3 (Time Ban/Blackhole) → also locked regardless
+        #     of confidence — re-running RF mid-ban only risks flipping the label.
+        #   - confidence < 0.70 OR class is Uncertain → fall through to re-classify
+        #     so Uncertain results get a chance to resolve to a real type.
+        from backend.mitigation.state_machine import state_machine
+        ip_state     = state_machine._states.get(src_ip)
+        already_banned = ip_state is not None and ip_state.phase >= 2
+
+        # Lock if: confidently classified (>=70%, real class) OR already in ban phase
+        is_locked = (
+            already_banned or
+            (cached.confidence >= 0.70 and cached.attack_class != "Uncertain")
+        )
+
+        if is_locked:
+            if _result_callback:
+                _result_callback(
+                    src_ip,
+                    cached.if_score, cached.is_anomaly,
+                    cached.attack_class, cached.confidence,
+                    flow_stats=flow_stats, switch_stats=switch_stats,
+                    timed_out=False,
+                )
+            return
+
+        # Confidence < 70% or still Uncertain — fall through to re-classify
+        # but preserve the cached class so a re-run returning Uncertain
+        # never overwrites a previously confident real classification.
+        tracker.invalidate_cache(src_ip)
+        # Stash the last known good class so RF re-run can restore it if needed
+        _prior_class = cached.attack_class
+        _prior_conf  = cached.confidence
 
     try:
         pre_flagged = is_syn_flagged
@@ -123,7 +159,10 @@ def _process_item(src_ip: str, flow_stats: dict,
         # Threshold raised 500 → 1000: fixed-IP attacks accumulate packets in one
         # flow so IF detects them normally. The bypass is now only a last-resort
         # safety net for extreme floods where IF is structurally blind.
-        if not is_anomaly and switch_delta_pps >= 1000.0 and if_score >= 0.50:
+        # Flood bypass: only force anomaly if score is ABOVE threshold.
+        # Old floor was 0.50 — this quarantined below-threshold IPs during floods.
+        # Now uses _effective_threshold so it respects the contract value (0.6004).
+        if not is_anomaly and switch_delta_pps >= 1000.0 and if_score >= _effective_threshold:
             is_anomaly = True
             log.debug("Flood bypass: %s  sw_delta=%.1f  IF=%.4f → forcing anomaly",
                       src_ip, switch_delta_pps, if_score)
@@ -132,15 +171,30 @@ def _process_item(src_ip: str, flow_stats: dict,
         confidence   = 0.0
 
         if is_anomaly:
-            # ICMP bug fix: ip_proto is per-flow (from OVS flow match),
-            # stored in flow_stats. RF reads it from switch_stats["ip_proto"].
-            # Inject it so RF gets the actual protocol, not the switch default.
+            # ip_proto fix: per-flow ip_proto ALWAYS overrides switch-level
+            # Restore prior confident class if available and RF returns Uncertain
+            # dominant proto. Switch aggregate gets polluted when multiple attack
+            # types run simultaneously (e.g. UDP + ICMP campaign) — the dominant
+            # switch proto may be ICMP even for a UDP flow, causing misclassification.
+            # Per-flow ip_proto from OVS flow match is always exact — use it.
             rf_switch = dict(switch_stats) if switch_stats else {}
             _flow_proto = int((flow_stats or {}).get("ip_proto", 0))
             if _flow_proto:
+                # Force override regardless of what switch_stats says
                 rf_switch["ip_proto"] = _flow_proto
+                log.debug("ip_proto override: %s → proto=%d (flow) over switch dominant",
+                          src_ip, _flow_proto)
             rf_vec              = rf_pipeline.extract_rf_features(rf_switch)
             attack_class, confidence = rf_pipeline.run_rf_inference(rf_vec)
+
+            # Guard: if re-run returns Uncertain but we had a prior confident
+            # classification (cache expired mid-attack), restore the prior class.
+            # Prevents label flipping during sustained attacks with mixed switch stats.
+            if attack_class == "Uncertain" and _prior_class not in (None, "Uncertain") and _prior_conf >= 0.70:
+                log.debug("RF re-run returned Uncertain — restoring prior class %s (conf=%.1f%%)",
+                          _prior_class, _prior_conf * 100)
+                attack_class = _prior_class
+                confidence   = _prior_conf
 
         # ── Diagnostic log — visible in backend terminal for every evaluated flow ──
         pps_display = float(flow_stats.get("packet_count_per_second", 0.0)) if flow_stats else 0.0

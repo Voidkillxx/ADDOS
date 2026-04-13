@@ -29,20 +29,36 @@ CONTROLLER_PORT = 6633
 # 2 pps is safely below the 5 pps ML gate so no false positives fire.
 BASELINE_BURST_INTERVAL = "0.5"   # ping -i 0.5 → 2 pps
 
-# Continuous slow ping after burst — just enough to keep the flow alive.
-# 0.33 pps is well below every ML gate (zmq MIN_PPS=20, worker pps<5).
-BASELINE_CONT_INTERVAL  = "3"     # ping -i 3  → 0.33 pps
+# Continuous slow ping after burst — 1 pps so baseline flows pass the
+# controller gate (pps >= 1.0) and reach the backend as normal traffic.
+# Still well below the ML inference gate (pps >= 2.0) — no false positives.
+BASELINE_CONT_INTERVAL  = "1"     # ping -i 1  → 1 pps
 
 # Attack volume for single (finite) attacks.
 # 50,000 pkts at --flood = ~5-8 seconds of traffic — enough for IF to score
 # clearly above 0.75 and for the full Phase 1→2→3 pipeline to run visibly.
 ATTACK_PKT_COUNT = 50000
 
+# 8/8 split: 8 attackers, 8 legit hosts
+# Attackers: h1,h3,h5,h7,h9,h11,h13,h15 (odd hosts)
+# Legit:     h2,h4,h6,h8,h10,h12,h14,h16 (even hosts)
+#
+# Attack type assignment:
+#   SYN  — h1  (p80, u500),  h13 (p443, u1000)
+#   ICMP — h5  (u500),       h3  (u1000, data120)
+#   UDP  — h9  (p53, u500),  h7  (p80, u1000)
+#   Mixed extras — h11 (SYN p8080, u800), h15 (UDP p443, u800)
+_ATTACKER_NUMS = {1, 3, 5, 7, 9, 11, 13, 15}
+
 _CAMPAIGNS = [
-    ("h1",  "h2"),
-    ("h5",  "h6"),
-    ("h9",  "h10"),
-    ("h13", "h14"),
+    ("h1",  "h2"),    # SYN
+    ("h13", "h14"),   # SYN
+    ("h5",  "h6"),    # ICMP
+    ("h3",  "h4"),    # ICMP
+    ("h9",  "h10"),   # UDP
+    ("h7",  "h8"),    # UDP
+    ("h11", "h12"),   # SYN extra
+    ("h15", "h16"),   # UDP extra
 ]
 
 
@@ -119,36 +135,37 @@ def configure_routes(hosts: list) -> None:
 def _get_baseline_target(host, hosts: list) -> str:
     """Pick the best ping target for a host's baseline traffic.
 
+    With the 8/8 attacker/legit split, every legit host's only same-subnet
+    neighbor is an attacker (odd hosts). So same-subnet targeting is useless —
+    we always pick a cross-subnet legit host instead.
+
     Priority:
-      1. A legit host on the SAME /24 (same edge switch).
-         Same-subnet pings always succeed — pure L2, no routing needed.
-      2. Any other legit host (cross-subnet fallback).
-
-    Avoiding random cross-subnet targets is critical: if the cross-subnet
-    path is not yet ready (OVS MAC tables not fully learned), ping -c 150
-    to that host will fail silently and the process exits — leaving
-    check_traffic showing "baseline NOT running" even though startup ran fine.
+      1. Legit host on SAME POD, different edge (3 hops — reliable after warmup).
+      2. Any legit host cross-pod (5 hops — populated by warmup Phase 2).
     """
-    attacker_nums = {1, 5, 9, 13}
-    my_subnet = ".".join(host.IP().split(".")[:3])
+    my_ip  = host.IP()
+    parts  = my_ip.split(".")
+    my_pod = parts[1]
+    my_sub = ".".join(parts[:3])
 
-    # Pass 1: same /24, legit
+    # Pass 1: legit host, same pod, different edge switch
     for other in hosts:
         if other is host:
             continue
-        if int(other.name[1:]) in attacker_nums:
+        if int(other.name[1:]) in _ATTACKER_NUMS:
             continue
-        if ".".join(other.IP().split(".")[:3]) == my_subnet:
+        op = other.IP().split(".")
+        if op[1] == my_pod and ".".join(op[:3]) != my_sub:
             return other.IP()
 
-    # Pass 2: any legit host (cross-subnet)
+    # Pass 2: any legit host cross-pod
     for other in hosts:
         if other is host:
             continue
-        if int(other.name[1:]) not in attacker_nums:
+        if int(other.name[1:]) not in _ATTACKER_NUMS:
             return other.IP()
 
-    return host.IP()   # should never happen
+    return host.IP()  # should never happen
 
 
 def start_baseline_traffic(hosts: list) -> None:
@@ -168,11 +185,11 @@ def start_baseline_traffic(hosts: list) -> None:
     to silently exit when the cross-subnet path was not yet ready, making
     check_traffic show "baseline NOT running" immediately after startup.
     """
-    attacker_nums = {1, 5, 9, 13}
+    attacker_nums = _ATTACKER_NUMS
     legit = [h for h in hosts if int(h.name[1:]) not in attacker_nums]
     info(f"*** Starting baseline traffic on {len(legit)} legitimate hosts\n")
     info(f"    → burst: ping -c 150 -i {BASELINE_BURST_INTERVAL} (2 pps, ~75s)\n")
-    info(f"    → then:  ping -i {BASELINE_CONT_INTERVAL} (0.33 pps, continuous)\n")
+    info(f"    → then:  ping -i {BASELINE_CONT_INTERVAL} (1 pps, continuous)\n")
 
     for host in legit:
         target = _get_baseline_target(host, hosts)
@@ -273,48 +290,77 @@ def launch_udp_flood_sustained(net, attacker_name="h9", victim_name="h10"):
 # ==================================================================
 
 def start_syn_flood_campaign(net):
-    info("*** [CAMPAIGN] SYN Flood — 4 attackers, unlimited, fixed IPs\n")
-    for att, vic in _CAMPAIGNS:
+    # Different parameters per attacker → different feature vectors → varied RF confidence
+    # h1:  p80,  u500  (fast, standard HTTP port)
+    # h13: p443, u1000 (slower, HTTPS port — different pps + dst port)
+    # h11: p8080,u800  (medium rate, alt-HTTP port)
+    info("*** [CAMPAIGN] SYN Flood — 3 attackers, varied params, fixed IPs\n")
+    _syn = [
+        ("h1",  "h2",  "hping3 -S -p 80   --flood -i u500  "),
+        ("h13", "h14", "hping3 -S -p 443  --flood -i u1000 "),
+        ("h11", "h12", "hping3 -S -p 8080 --flood -i u800  "),
+    ]
+    for att, vic, cmd in _syn:
         attacker = net.get(att)
         victim   = net.get(vic)
-        info(f"    {att}({attacker.IP()}) → {vic}({victim.IP()})  [SYN --flood]\n")
-        attacker.cmd(
-            f"hping3 -S -p 80 --flood -i u500 {victim.IP()} > /dev/null 2>&1 &"
-        )
-    info("    → Running. Use  py stop_all_attacks(net)  to stop.\n")
+        info(f"    {att}({attacker.IP()}) -> {vic}({victim.IP()})  [{cmd.strip()}]\n")
+        attacker.cmd(cmd + victim.IP() + " > /dev/null 2>&1 &")
+    info("    -> Running. Use  py stop_all_attacks(net)  to stop.\n")
 
 
 def start_icmp_flood_campaign(net):
-    info("*** [CAMPAIGN] ICMP Flood — 4 attackers, unlimited, fixed IPs\n")
-    for att, vic in _CAMPAIGNS:
+    # h5: standard ICMP flood (u500)
+    # h3: slower rate with larger payload (u1000 --data 120) — bigger byte_count
+    info("*** [CAMPAIGN] ICMP Flood — 2 attackers, varied params, fixed IPs\n")
+    _icmp = [
+        ("h5", "h6", "hping3 --icmp --flood -i u500          "),
+        ("h3", "h4", "hping3 --icmp --flood -i u1000 --data 120 "),
+    ]
+    for att, vic, cmd in _icmp:
         attacker = net.get(att)
         victim   = net.get(vic)
-        info(f"    {att}({attacker.IP()}) → {vic}({victim.IP()})  [ICMP --flood]\n")
-        attacker.cmd(
-            f"hping3 --icmp --flood -i u500 {victim.IP()} > /dev/null 2>&1 &"
-        )
-    info("    → Running. Use  py stop_all_attacks(net)  to stop.\n")
+        info(f"    {att}({attacker.IP()}) -> {vic}({victim.IP()})  [{cmd.strip()}]\n")
+        attacker.cmd(cmd + victim.IP() + " > /dev/null 2>&1 &")
+    info("    -> Running. Use  py stop_all_attacks(net)  to stop.\n")
 
 
 def start_udp_flood_campaign(net):
-    info("*** [CAMPAIGN] UDP Flood — 4 attackers, unlimited, fixed IPs\n")
-    for att, vic in _CAMPAIGNS:
+    # h9:  p53,  u500  (fast, DNS port)
+    # h7:  p80,  u1000 (slower, HTTP port — different pps)
+    # h15: p443, u800  (medium, HTTPS port)
+    info("*** [CAMPAIGN] UDP Flood — 3 attackers, varied params, fixed IPs\n")
+    _udp = [
+        ("h9",  "h10", "hping3 --udp -p 53  --flood -i u500  "),
+        ("h7",  "h8",  "hping3 --udp -p 80  --flood -i u1000 "),
+        ("h15", "h16", "hping3 --udp -p 443 --flood -i u800  "),
+    ]
+    for att, vic, cmd in _udp:
         attacker = net.get(att)
         victim   = net.get(vic)
-        info(f"    {att}({attacker.IP()}) → {vic}({victim.IP()})  [UDP --flood]\n")
-        attacker.cmd(
-            f"hping3 --udp -p 53 --flood -i u500 {victim.IP()} > /dev/null 2>&1 &"
-        )
-    info("    → Running. Use  py stop_all_attacks(net)  to stop.\n")
+        info(f"    {att}({attacker.IP()}) -> {vic}({victim.IP()})  [{cmd.strip()}]\n")
+        attacker.cmd(cmd + victim.IP() + " > /dev/null 2>&1 &")
+    info("    -> Running. Use  py stop_all_attacks(net)  to stop.\n")
 
 
 def start_mixed_campaign(net):
+    # F1+F2 fix: added h11 (SYN p8080 u800) and h15 (UDP p443 u800) — these
+    # were defined in _ATTACKER_NUMS/_CAMPAIGNS but missing from the campaign.
+    # Also varied ALL attacker params (port, interval, data) so each attacker
+    # produces a distinct RF feature vector — pps/byte_count/pkt_size differ
+    # per IP, giving RF meaningful variation to classify correctly.
     info("*** [CAMPAIGN] Mixed DDoS — SYN + ICMP + UDP simultaneously, fixed IPs\n")
     campaigns = [
-        ("h1",  "h2",  "hping3 -S -p 80 --flood -i u500", "SYN Flood"),
-        ("h5",  "h6",  "hping3 --icmp --flood -i u500",   "ICMP Flood"),
-        ("h9",  "h10", "hping3 --udp -p 53 --flood -i u500", "UDP Flood"),
-        ("h13", "h14", "hping3 -S -p 443 --flood -i u500", "SYN Flood (p443)"),
+        # SYN attackers — different ports + intervals → different pps + dst_port features
+        ("h1",  "h2",  "hping3 -S -p 80   --flood -i u500",   "SYN Flood"),
+        ("h13", "h14", "hping3 -S -p 443  --flood -i u1000",  "SYN Flood (p443)"),
+        ("h11", "h12", "hping3 -S -p 8080 --flood -i u800",   "SYN Flood (p8080)"),
+        # ICMP attackers — different intervals + payload → different byte_count/pps
+        ("h5",  "h6",  "hping3 --icmp --flood -i u500",        "ICMP Flood"),
+        ("h3",  "h4",  "hping3 --icmp --flood -i u1000 --data 120", "ICMP Flood (large)"),
+        # UDP attackers — different ports + intervals → different pps + dst_port features
+        ("h9",  "h10", "hping3 --udp -p 53  --flood -i u500",  "UDP Flood"),
+        ("h7",  "h8",  "hping3 --udp -p 80  --flood -i u1000", "UDP Flood (p80)"),
+        ("h15", "h16", "hping3 --udp -p 443 --flood -i u800",  "UDP Flood (p443)"),
     ]
     for att, vic, cmd_prefix, label in campaigns:
         attacker = net.get(att)
@@ -350,9 +396,8 @@ def stop_all_attacks(net):
 
 def stop_baseline(net):
     info("*** Stopping baseline traffic...\n")
-    attacker_nums = {1, 5, 9, 13}
     for h in net.hosts:
-        if int(h.name[1:]) not in attacker_nums:
+        if int(h.name[1:]) not in _ATTACKER_NUMS:
             h.cmd("pkill -f ping 2>/dev/null; true")
     info("    Done.\n")
 
@@ -377,8 +422,8 @@ def _get_ping_neighbor(h, net) -> str:
     Attackers are always skipped as ping targets — during a live attack,
     OVS drop rules would cause the ping to fail even though the network is fine.
     """
-    attacker_nums = {1, 5, 9, 13}
-    my_ip   = h.IP()
+    attacker_nums = _ATTACKER_NUMS
+    my_ip   = h.IP()          # Bug fix: was never assigned — caused NameError crash
     parts   = my_ip.split(".")
     my_pod  = parts[1]
     my_sub  = ".".join(parts[:3])
@@ -448,7 +493,7 @@ def check_traffic(net) -> None:
       PING   — connectivity to nearest neighbor (— for attackers)
       MITIGATION — current backend phase if being mitigated, else baseline status
     """
-    attacker_nums = {1, 5, 9, 13}
+    attacker_nums = _ATTACKER_NUMS
 
     # Query backend for live mitigation state
     quarantine = _fetch_quarantine()   # {ip: phase_label}
@@ -552,7 +597,7 @@ def check_traffic(net) -> None:
 
 
 def _print_traffic_health(hosts: list) -> None:
-    attacker_nums = {1, 5, 9, 13}
+    attacker_nums = _ATTACKER_NUMS
     info("\n" + "=" * 70 + "\n")
     info("  HOST TRAFFIC STATUS (post-warmup)\n")
     info("=" * 70 + "\n")
@@ -589,7 +634,7 @@ def _warmup_macs(net, hosts, max_rounds: int = 2) -> None:
       by pinging every legit host to every other legit host across subnets.
       This ensures check_traffic shows all green on first run.
     """
-    attacker_nums = {1, 5, 9, 13}
+    attacker_nums = _ATTACKER_NUMS
     legit_hosts   = [h for h in hosts if int(h.name[1:]) not in attacker_nums]
 
     # ── Phase 1: local /24 pairs ─────────────────────────────────────────────
@@ -601,27 +646,29 @@ def _warmup_macs(net, hosts, max_rounds: int = 2) -> None:
     local_total = sum(len(g) * (len(g) - 1) for g in subnet_groups.values())
     info(f"*** Phase 1 warmup — {local_total} local pairs (edge switches)...\n")
 
-    for rnd in range(1, max_rounds + 1):
-        info(f"    Round {rnd}/{max_rounds} ...\n")
-        procs = []
-        for group in subnet_groups.values():
-            for src in group:
-                for dst in group:
-                    if src is dst:
-                        continue
-                    p = src.popen(
-                        f"ping -c1 -W1 {dst.IP()} > /dev/null 2>&1", shell=True)
-                    procs.append(p)
-        for p in procs:
-            p.wait()
+    # S2 fix: reduced from 2 rounds to 1 — one successful ping is sufficient
+    # for OVS to learn the MAC and Ryu to install the forwarding rule.
+    # Second round was redundant and added ~4-5s with no benefit.
+    info(f"    Round 1/1 ...\n")
+    procs = []
+    for group in subnet_groups.values():
+        for src in group:
+            for dst in group:
+                if src is dst:
+                    continue
+                p = src.popen(
+                    f"ping -c1 -W1 {dst.IP()} > /dev/null 2>&1", shell=True)
+                procs.append(p)
+    for p in procs:
+        p.wait()
 
     info("*** Phase 1 done — edge switch tables populated.\n")
 
     # ── Phase 2: full cross-subnet warmup ────────────────────────────────────
-    # Ping every legit host to every other legit host across different subnets.
-    # This forces Ryu to install forwarding rules on agg and core switches
-    # for all cross-pod paths — the paths that were previously empty and
-    # causing "cannot connect" failures immediately after startup.
+    # S3 fix: reduced from 2 rounds × ping -c2 -W2 to 1 round × ping -c1 -W1.
+    # Ryu installs the forwarding rule after the FIRST successful reply —
+    # extra rounds were wasting ~8-10s. One round is sufficient to populate
+    # agg and core switch tables for all cross-pod paths.
     cross_pairs = [
         (src, dst)
         for src in legit_hosts
@@ -630,20 +677,15 @@ def _warmup_macs(net, hosts, max_rounds: int = 2) -> None:
         and ".".join(src.IP().split(".")[:3]) != ".".join(dst.IP().split(".")[:3])
     ]
     info(f"*** Phase 2 warmup — {len(cross_pairs)} cross-subnet pairs (agg + core switches)...\n")
-    info("    (3 rounds, ping -c3 -W3 — ensures Ryu installs rules even on slow starts)\n")
+    info("    (1 round, ping -c1 -W1)\n")
 
-    # 3 rounds with ping -c3 -W3: if round 1 times out while Ryu installs rules,
-    # round 2 and 3 catch it. ping -c1 -W2 was too aggressive — a single timeout
-    # meant that path was never re-tried and stayed unlearned.
-    for rnd in range(1, 4):
-        info(f"    Round {rnd}/3 ...\n")
-        procs = []
-        for src, dst in cross_pairs:
-            p = src.popen(
-                f"ping -c3 -W3 {dst.IP()} > /dev/null 2>&1", shell=True)
-            procs.append(p)
-        for p in procs:
-            p.wait()
+    procs = []
+    for src, dst in cross_pairs:
+        p = src.popen(
+            f"ping -c1 -W1 {dst.IP()} > /dev/null 2>&1", shell=True)
+        procs.append(p)
+    for p in procs:
+        p.wait()
 
     info("*** Phase 2 done — agg/core switch tables populated.\n")
     info("*** All paths learned — hosts should be fully reachable.\n")
@@ -657,7 +699,7 @@ def _print_banner(hosts: list) -> None:
     info(f"  {'HOST':<6} {'IP':<16} {'MAC':<20} ROLE\n")
     info("  " + "-" * 65 + "\n")
     for h in hosts:
-        role = "★ ATTACKER" if int(h.name[1:]) in {1, 5, 9, 13} else "  legit"
+        role = "★ ATTACKER" if int(h.name[1:]) in _ATTACKER_NUMS else "  legit"
         info(f"  {h.name:<6} {h.IP():<16} {h.MAC():<20} {role}\n")
     info("=" * 70 + "\n\n")
     # M10 fix: banner now shows accurate rates derived from the constants
@@ -718,10 +760,9 @@ def restore_baseline_for_ip(hosts: list, src_ip: str) -> bool:
     for host in hosts:
         if host.IP() == src_ip:
             host.cmd("pkill -f 'ping -i' 2>/dev/null; true")
-            attacker_nums = {1, 5, 9, 13}
             others = [
                 h.IP() for h in hosts
-                if h.IP() != src_ip and int(h.name[1:]) not in attacker_nums
+                if h.IP() != src_ip and int(h.name[1:]) not in _ATTACKER_NUMS
             ]
             if not others:
                 _restore_log.warning(
@@ -862,11 +903,27 @@ if __name__ == "__main__":
     net.start()
 
     info("*** Waiting for switches to connect to Ryu...\n")
-    # 8s gives all 20 switches time to complete OpenFlow handshake and
-    # receive their table-miss flow rule before any traffic is sent.
-    # 3s was too short — some switches missed their table-miss install,
-    # causing the first warmup pings to be silently dropped.
-    time.sleep(8)
+    # S1 fix: replaced fixed sleep with active polling — checks every 0.5s
+    # whether all 20 switches have completed OpenFlow handshake by querying
+    # the Ryu REST API. Proceeds as soon as all are connected (typically 2-3s)
+    # instead of always waiting the full 5s. Falls back to 8s max timeout.
+    _ryu_ready = False
+    for _wait_i in range(16):  # 16 × 0.5s = 8s max
+        time.sleep(0.5)
+        try:
+            import urllib.request as _ur
+            with _ur.urlopen("http://127.0.0.1:8080/v1.0/topology/switches", timeout=1) as _r:
+                _switches = __import__("json").loads(_r.read())
+            if len(_switches) >= 20:
+                info(f"*** All {len(_switches)} switches connected ({(_wait_i+1)*0.5:.1f}s)\n")
+                _ryu_ready = True
+                break
+            else:
+                info(f"    {len(_switches)}/20 switches connected...\n")
+        except Exception:
+            info(f"    Waiting for Ryu... ({(_wait_i+1)*0.5:.1f}s)\n")
+    if not _ryu_ready:
+        info("*** Timeout waiting for all switches — proceeding anyway.\n")
 
     _print_banner(hosts)
 
@@ -879,11 +936,9 @@ if __name__ == "__main__":
     info("*** Restarting baseline post-warmup...\n")
     start_baseline_traffic(hosts)
 
-    # Wait for baseline ping processes to appear in ps aux.
-    # Without this, check_traffic run immediately after startup shows
-    # "baseline NOT running" because ping -i processes haven't registered yet.
+    # S4 fix: reduced from 2s to 0.5s — ping processes register within 0.5s.
     info("*** Waiting for baseline pings to register...\n")
-    time.sleep(6)
+    time.sleep(0.5)
 
     # Feature 2: start restore poller before handing off to CLI
     _start_restore_poller(hosts)

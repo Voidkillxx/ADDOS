@@ -14,24 +14,25 @@ def stats():
     raw_total = raw["raw_total"]
     malicious = session.get("malicious_dropped", 0)
 
+    # Use whichever counter is larger — raw_total from ZMQ counts raw packet
+    # deltas but resets on reconnect and misses low-pps baseline flows.
+    # session total_packets counts every on_result() call reliably.
+    # Taking the max ensures the UI always shows the most accurate count.
+    effective_total = max(raw_total, session.get("total_packets", 0))
+
     # C2 fix: Normal Traffic = Total − Malicious (Option A, approved).
-    # Previously stats.py served raw["raw_normal"] which equalled raw_total
-    # because zmq_receiver set _raw_normal_pkts = delta_pkts for ALL traffic
-    # and the promised "DE corrects if attack" correction was never implemented.
-    # The result: Normal Traffic card always matched Total Traffic exactly.
-    # Now computed directly from sources that are already accurate.
-    normal = max(raw_total - malicious, 0)
+    normal = max(effective_total - malicious, 0)
 
     fp_rate = session.get("fp_rate", 0.0)
 
     return jsonify({
         # Summary cards
-        "total_packets":     raw_total,
+        "total_packets":     effective_total,
         "malicious_dropped": malicious,
         "normal_packets":    normal,
 
         # Live chart deltas (same sources — cards and chart now always match)
-        "live_total":        raw_total,
+        "live_total":        effective_total,
         "live_malicious":    malicious,
         "live_normal":       normal,
 

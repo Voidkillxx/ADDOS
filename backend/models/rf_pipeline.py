@@ -22,11 +22,17 @@ def extract_rf_features(flow_stats: dict) -> np.ndarray:
     rfip_raw         = float(s.get("rfip",           0))
     gsp_raw          = float(s.get("gsp",            0))
     # ip_proto: ICMP=1, TCP=6, UDP=17 — injected from flow at inference time
-    ip_proto_raw     = float(s.get("ip_proto",       0))
+    # Pass RAW value — RobustScaler was fitted on raw values (median=6, IQR=16).
+    # 3x amplification removed: it pushed SYN(6→18) into UDP territory and
+    # UDP(17→51) completely out-of-distribution, causing both to score below
+    # confidence_gate and return "Uncertain".
+    ip_proto_raw     = float(s.get("ip_proto", 0))
 
     # --- [0]–[11]: base features ---
-    # avg_durat arrives in µs from Ryu — multiply by 1000 to get ns
-    avg_durat_ns = avg_durat_raw * 1000.0
+    # avg_durat: Ryu sends microseconds (sec*1e6 + nsec/1000).
+    # Training dataset avg_durat is ~5e17 ns scale — RobustScaler handles the range.
+    # Pass raw value directly; multiplication was causing extra OOD shift.
+    avg_durat_ns = avg_durat_raw
 
     f = [
         np.log1p(max(disp_pakt_raw,    0)),   # [0]  disp_pakt

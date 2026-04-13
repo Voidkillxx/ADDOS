@@ -12,9 +12,27 @@ log = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 
+# Known legit host IPs in the K=4 fat-tree topology — 8/8 split.
+# Attacker hosts (odd): h1,h3,h5,h7,h9,h11,h13,h15
+# Legit hosts (even):   h2,h4,h6,h8,h10,h12,h14,h16
+_LEGIT_HOST_IPS: frozenset = frozenset([
+    "10.0.0.2",  # h2
+    "10.0.1.2",  # h4
+    "10.1.0.2",  # h6
+    "10.1.1.2",  # h8
+    "10.2.0.2",  # h10
+    "10.2.1.2",  # h12
+    "10.3.0.2",  # h14
+    "10.3.1.2",  # h16
+])
+
 _stats = {
     "total_packets":     0,
-    "malicious_dropped": 0,
+    "malicious_dropped": 0,   # ML events classified as malicious (not physical drops)
+    "actual_pkts_dropped": 0, # F3 fix: real physical packets dropped at OVS level
+                               # accumulated from "dropped_delta" ZMQ messages sent
+                               # by ryu_controller when blocked flow entries are polled.
+                               # This is what the UI should show as "Malicious Dropped".
     "normal_packets":    0,
     "false_positives":   0,
     "ml_processed":      0,
@@ -79,16 +97,54 @@ def _push_debug(entry: dict) -> None:
         _debug_buffer.append(entry)
 
 
+def record_dropped_packets(src_ip: str, delta: int) -> None:
+    """Called by ZMQ receiver for every 'dropped_delta' message from ryu_controller.
+
+    F3 fix: accumulates REAL physical packet drop counts from OVS blocked flow
+    entries (priority 80/90/100). This gives the UI an accurate 'Malicious Dropped'
+    counter instead of the misleading per-ML-event count.
+
+    Call this from zmq_receiver.py when msg["type"] == "dropped_delta":
+        from backend.pipeline.decision_engine import record_dropped_packets
+        record_dropped_packets(msg["src_ip"], msg["delta"])
+    """
+    with _lock:
+        _stats["actual_pkts_dropped"] += delta
+
+
 def get_stats() -> dict:
     with _lock:
         s = _stats.copy()
-    # L13 fix: removed dead `total = max(s["total_packets"], 1)` variable
-    # that was computed but never referenced anywhere in the returned dict.
     samples = max(s["latency_samples"], 1)
+
+    # Fix A: use _raw_total_pkts from zmq_receiver as total_packets.
+    # Previously total_packets only counted flows that reached on_result()
+    # (i.e. passed the MIN_PPS=2.0 gate) — baseline pings at 0.33 pps were
+    # never counted → UI showed 8 even though hundreds of packets had flowed.
+    # _raw_total_pkts accumulates delta_pkts from EVERY flow_stats message,
+    # including below-threshold flows, giving the true total packet count.
+    try:
+        from backend.transport.zmq_receiver import get_raw_counts
+        raw_total = max(get_raw_counts()["raw_total"], s["total_packets"])
+    except Exception:
+        raw_total = s["total_packets"]  # fallback if receiver not started yet
+
+    # F3 fix: use actual_pkts_dropped (real OVS drops) as malicious_dropped.
+    real_dropped = s["actual_pkts_dropped"] if s["actual_pkts_dropped"] > 0 else s["malicious_dropped"]
+
+    # Bug 2+3 fix: actual_pkts_dropped accumulates across ZMQ reconnects but
+    # raw_total resets to 0 on each reconnect (_reset_flow_state).  Clamp so
+    # dropped can never exceed total — prevents negative normal_packets and the
+    # "Malicious Dropped > Total Detected" UI anomaly.
+    real_dropped = min(real_dropped, raw_total)
+
+    # normal_packets = total observed − confirmed malicious drops
+    normal = max(raw_total - real_dropped, 0)
+
     return {
-        "total_packets":     s["total_packets"],
-        "malicious_dropped": s["malicious_dropped"],
-        "normal_packets":    s["normal_packets"],
+        "total_packets":     raw_total,
+        "malicious_dropped": real_dropped,
+        "normal_packets":    normal,
         "active_threats":    len(state_machine.get_active_list()),
         "fp_rate":           round((s["false_positives"] / max(s["ml_processed"], 1)) * 100, 2),
         "avg_latency_ms":    round(s["total_latency_ms"] / samples, 1),
@@ -137,12 +193,12 @@ def drain_sse_events() -> list[dict]:
     return events
 
 
-def _push_sse_event(event: dict) -> None:
+def _push_sse_event(event: dict, force: bool = False) -> None:
     now = time.monotonic()
-    key = (event.get("src_ip"), event.get("attack_vector"))
+    key = event.get("src_ip")
     with _sse_lock:
         last = _sse_dedup.get(key, 0)
-        if now - last < _SSE_DEDUP_TTL:
+        if not force and now - last < _SSE_DEDUP_TTL:
             return
         _sse_dedup[key] = now
         _sse_buffer.append(event)
@@ -209,33 +265,55 @@ def on_result(src_ip: str, if_score, is_anomaly,
 
     loader.require_loaded()
 
-    is_uncertain    = (attack_class == "Uncertain")
-    below_conf_gate = (confidence is None or confidence < loader.rf_conf_gate)
+    # IF score > threshold confirmed anomaly — quarantine regardless of RF confidence.
+    # RF "Uncertain" just means attack TYPE is unknown, not that it's safe.
+    # The IF already confirmed it's anomalous — proceed with mitigation.
+    # Low-confidence RF result is shown in UI as "Uncertain" attack vector.
+    log.debug("Anomaly confirmed: %s  IF=%.4f  RF=%s  conf=%.1f%%",
+              src_ip, if_score, attack_class, (confidence or 0)*100)
 
-    if is_uncertain and below_conf_gate:
-        with _lock:
-            _stats["normal_packets"] += 1
-            # Not incrementing false_positives — these flows were never blocked,
-            # so they are not operational false positives.
-        writer.log_traffic_summary(total=1, threats=0, true_neg=0, fp=0)
-        log.debug("Skipping %s — Uncertain %.1f%% < gate %.0f%%",
-                  src_ip, (confidence or 0)*100, loader.rf_conf_gate*100)
-        return
+    # F4 fix: update recent_pps on the state so _evaluate_phase1 can check
+    # whether traffic is still active before escalating to a time ban.
+    _recent_pps = float((flow_stats or {}).get("packet_count_per_second", 0.0))
+    with state_machine._lock:
+        _existing_state = state_machine._states.get(src_ip)
+        if _existing_state is not None:
+            _existing_state.recent_pps = _recent_pps
 
-    if confidence is not None and confidence < 0.60:
+    # Bug 3a fix: check if legit host BEFORE mitigation so FPR updates immediately
+    # in the UI. Previously this check ran after on_detection() and db writes,
+    # causing the FP counter to lag behind what was shown in the dashboard.
+    is_known_legit = src_ip in _LEGIT_HOST_IPS
+    if is_known_legit:
         with _lock:
-            _stats["normal_packets"] += 1
-            # Same reasoning — not blocked, not a real operational FP.
-        writer.log_traffic_summary(total=1, threats=0, true_neg=0, fp=0)
-        log.debug("Skipping %s — low confidence %.1f%% (class=%s)",
-                  src_ip, confidence*100, attack_class)
-        return
+            _stats["false_positives"] += 1
+        writer.log_traffic_summary(total=0, threats=0, true_neg=0, fp=1)
+        log.warning("FALSE POSITIVE detected: %s is a known legit host!", src_ip)
 
     predicted_class = "DDoS" if attack_class != "Uncertain" else "Anomaly"
     priority        = _assign_priority(if_score, confidence)
-    action_taken    = state_machine.on_detection(
-        src_ip, if_score, attack_class, confidence
-    )
+
+    # Check if IP was previously banned and is re-offending
+    existing = state_machine._states.get(src_ip)
+    if existing is None:
+        # Check history for prior bans on this IP
+        from backend.database.db import query as _q
+        prior = _q(
+            "SELECT ban_level, offence_count FROM ip_attack_history WHERE src_ip=? ORDER BY id DESC LIMIT 1",
+            (src_ip,)
+        )
+        if prior and prior[0].get("ban_level", 0) is not None:
+            prev_ban   = int(prior[0].get("ban_level", 0) or 0)
+            prev_off   = int(prior[0].get("offence_count", 0) or 0)
+            if prev_ban > 0 or prev_off > 0:
+                state_machine.on_reoffence(src_ip, if_score, attack_class, confidence, prev_ban, prev_off)
+                action_taken = state_machine._states[src_ip].action_taken if src_ip in state_machine._states else "Quarantined"
+            else:
+                action_taken = state_machine.on_detection(src_ip, if_score, attack_class, confidence)
+        else:
+            action_taken = state_machine.on_detection(src_ip, if_score, attack_class, confidence)
+    else:
+        action_taken = state_machine.on_detection(src_ip, if_score, attack_class, confidence)
 
     with _lock:
         _stats["malicious_dropped"] += 1
@@ -245,6 +323,9 @@ def on_result(src_ip: str, if_score, is_anomaly,
     ip_state    = state_machine._states.get(src_ip)
     phase_label = ip_state.phase_label() if ip_state else None
 
+    # Always INSERT a new row — never upsert/overwrite.
+    # This ensures re-offences and phase escalations each get their own
+    # audit log entry so the operator sees the full history per IP.
     writer.log_mitigation_event({
         "timestamp":       ts,
         "src_ip":          src_ip,
@@ -256,6 +337,7 @@ def on_result(src_ip: str, if_score, is_anomaly,
         "if_score":        if_score,
         "phase":           phase_label,
         "is_manual":       0,
+        "force_insert":    True,   # never overwrite existing rows
     })
     writer.log_traffic_summary(total=1, threats=1, true_neg=0, fp=0)
 
@@ -277,6 +359,9 @@ def on_result(src_ip: str, if_score, is_anomaly,
         "action":      action_taken,
     })
 
+    # Force-push SSE on phase upgrades (Quarantine→TimeBan, →Blackhole)
+    # so the audit log always reflects the latest phase, bypassing dedup.
+    _phase_upgrade = action_taken in ("Time Ban", "Blackhole")
     _push_sse_event({
         "timestamp":       ts,
         "src_ip":          src_ip,
@@ -285,7 +370,7 @@ def on_result(src_ip: str, if_score, is_anomaly,
         "confidence":      f"{confidence * 100:.1f}%",
         "priority":        priority,
         "action_taken":    action_taken,
-    })
+    }, force=_phase_upgrade)
 
 
 def start() -> None:

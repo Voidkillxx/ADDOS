@@ -16,7 +16,7 @@ from ryu.lib import hub
 
 TELEMETRY_ADDR = "tcp://127.0.0.1:5555"
 COMMAND_ADDR   = "tcp://127.0.0.1:5556"
-STATS_INTERVAL = 2.0
+STATS_INTERVAL = 0.5  # Lowered from 2.0s — faster attack detection
 
 
 class FatTreeController(app_manager.RyuApp):
@@ -40,6 +40,11 @@ class FatTreeController(app_manager.RyuApp):
         self._datapaths: dict   = {}
         self._mac_to_port: dict = collections.defaultdict(dict)
 
+        # Fix B: shared switch count — written on connect/disconnect,
+        # read by the backend /api/switches endpoint so topology.py
+        # can poll it without needing Ryu's REST topology app.
+        FatTreeController._connected_count = 0
+
         self._switch_prev_total: dict[int, tuple] = {}
 
         self._switch_agg: dict = collections.defaultdict(lambda: {
@@ -49,16 +54,31 @@ class FatTreeController(app_manager.RyuApp):
             "last_reply_ts": None, "disp_interval": 1.0,
         })
 
+        # F3 fix: track cumulative dropped packets per src_ip from blocked OFP
+        # flow entries (priority 80/90/100, empty instructions = drop).
+        # Sent to backend via ZMQ telemetry as "dropped_packets" aggregate so
+        # the UI shows real physical packet drops, not just ML event count.
+        self._blocked_prev_pkts: dict[str, int] = {}  # src_ip → last seen pkt_count
+
         self._pkt_in_count: dict = collections.defaultdict(int)
         # _pkt_in_ts removed — was initialized but never read or written anywhere.
 
         self._port_counts: dict = collections.defaultdict(int)
+
+        # Set of currently banned src IPs — updated by _apply_command.
+        # Throttled packets check this before forwarding so banned IPs
+        # are dropped even when the flow table is bypassed by OFPPacketOut.
+        self._banned_ips: set = set()
 
         # Track dominant ip_proto per switch per polling interval.
         # Counts {dpid: {proto_num: count}} — reset each FlowStats reply.
         # Injected into switch_stats as ip_proto for RF classification.
         # ICMP=1, TCP/SYN=6, UDP=17  (matches FILENAME_PROTO_MAP in training)
         self._switch_proto: dict = collections.defaultdict(lambda: collections.defaultdict(int))
+
+        # Per-src-IP protocol tracker: src_ip → last seen ip_proto
+        # Reset each FlowStats interval. Used to inject correct ip_proto per flow.
+        self._src_proto: dict = collections.defaultdict(lambda: collections.defaultdict(int))
 
         # PacketIn rate limiter — prevents controller overload during rand-source floods.
         # Key: dpid → (count_in_window, window_start_monotonic)
@@ -81,11 +101,33 @@ class FatTreeController(app_manager.RyuApp):
         ofp    = dp.ofproto
         parser = dp.ofproto_parser
         self._datapaths[dp.id] = dp
+        FatTreeController._connected_count = len(self._datapaths)
         self.logger.info(
             '✔ Switch CONNECTED  dpid=%016x  (%d/%d switches)',
             dp.id, len(self._datapaths), 20
         )
+        # Fix B: push switch count via ZMQ so topology.py can poll it
+        # without needing the Ryu REST topology app (which gives 404).
+        self._push({
+            "type":          "switch_count",
+            "connected":     len(self._datapaths),
+        })
 
+        # Flush ALL existing flow rules (priority 1) so old rules without
+        # ip_proto in the match are removed immediately. New rules installed
+        # by packet_in_handler will include ip_proto for correct RF classification.
+        flush_match = parser.OFPMatch()
+        flush_mod   = parser.OFPFlowMod(
+            datapath  = dp,
+            command   = ofp.OFPFC_DELETE,
+            out_port  = ofp.OFPP_ANY,
+            out_group = ofp.OFPG_ANY,
+            priority  = 1,
+            match     = flush_match,
+        )
+        dp.send_msg(flush_mod)
+
+        # Install table-miss rule (send unknown packets to controller)
         match   = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         inst    = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
@@ -98,6 +140,7 @@ class FatTreeController(app_manager.RyuApp):
         dp   = ev.datapath
         dpid = dp.id
         self._datapaths.pop(dpid, None)
+        FatTreeController._connected_count = len(self._datapaths)
         self._switch_agg.pop(dpid, None)
         self._pkt_in_count.pop(dpid, None)
         self._port_counts.pop(dpid, None)
@@ -152,10 +195,20 @@ class FatTreeController(app_manager.RyuApp):
             # Still count for rate_pkt_in — this is how switch_delta_pps
             # detects the flood even when no flow rules are being installed.
             self._pkt_in_count[dpid] += 1
-            # Forward: flood so the packet still reaches its destination.
-            # We don't know the dst MAC (no MAC learning at this rate), so
-            # flooding is the correct fallback. Legit traffic has flow rules
-            # already installed from warmup so it bypasses the controller.
+
+            # Bug fix: check if src IP is banned before forwarding.
+            # Previously ALL throttled packets were forwarded via OFPPacketOut
+            # which bypasses the OVS flow table entirely — so banned IPs kept
+            # getting their packets forwarded even during a Time Ban/Blackhole.
+            # We need to parse just enough to get src_ip for the ban check.
+            try:
+                _raw_pkt = packet.Packet(msg.data)
+                _raw_ip  = _raw_pkt.get_protocol(ipv4.ipv4)
+                if _raw_ip and _raw_ip.src in self._banned_ips:
+                    return  # drop silently — IP is banned
+            except Exception:
+                pass  # parse failed — fall through to forward
+
             actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
             if msg.buffer_id != ofp.OFP_NO_BUFFER:
                 out = parser.OFPPacketOut(
@@ -221,9 +274,14 @@ class FatTreeController(app_manager.RyuApp):
         # Count for rate_pkt_in
         self._pkt_in_count[dpid] += 1
 
-        # Track protocol distribution per switch for RF ip_proto feature
+        # Track protocol per (switch, src_ip) — used to inject correct proto per flow.
+        # Also track switch-wide for dominant_proto fallback.
+        # F5 fix: _src_proto stores the MOST RECENT proto seen for each src_ip
+        # (direct assignment, not increment) — this way if an IP is seen with a
+        # new protocol it updates immediately instead of accumulating old counts.
         if ip4.proto:
             self._switch_proto[dpid][ip4.proto] += 1
+            self._src_proto[dpid][src_ip] = ip4.proto   # overwrite with latest
 
         # Push telemetry for SYN tracking and packet_in events
         self._push({
@@ -246,19 +304,24 @@ class FatTreeController(app_manager.RyuApp):
 
         actions = [parser.OFPActionOutput(out_port)]
 
-        # Install flow rule (with ipv4_src for per-IP FlowStats detection)
-        if out_port != ofp.OFPP_FLOOD:
+        # Install flow rule WITH ip_proto in match — critical for RF classification.
+        # Without ip_proto in match, OVS creates ONE rule per src_ip matching all
+        # protocols. FlowStats then has no ip_proto field → RF always gets proto=0
+        # → falls back to ICMP. With ip_proto in match, OVS creates separate entries
+        # per (src_ip, proto): TCP=6, ICMP=1, UDP=17 — RF gets the real protocol.
+        if out_port != ofp.OFPP_FLOOD and ip4.proto:
             match = parser.OFPMatch(
                 in_port=in_port,
                 eth_type=0x0800,
-                ipv4_src=src_ip,   # REQUIRED for per-IP telemetry in FlowStats
+                ip_proto=ip4.proto,  # KEY FIX: separate flow entry per protocol
+                ipv4_src=src_ip,
                 eth_dst=eth.dst,
             )
             inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
             if msg.buffer_id != ofp.OFP_NO_BUFFER:
                 mod = parser.OFPFlowMod(
                     datapath=dp, priority=1,
-                    idle_timeout=60, hard_timeout=0,
+                    idle_timeout=10, hard_timeout=0,
                     buffer_id=msg.buffer_id,
                     match=match, instructions=inst)
                 dp.send_msg(mod)
@@ -266,7 +329,7 @@ class FatTreeController(app_manager.RyuApp):
             else:
                 mod = parser.OFPFlowMod(
                     datapath=dp, priority=1,
-                    idle_timeout=60, hard_timeout=0,
+                    idle_timeout=10, hard_timeout=0,
                     match=match, instructions=inst)
                 dp.send_msg(mod)
 
@@ -296,7 +359,14 @@ class FatTreeController(app_manager.RyuApp):
         agg["last_reply_ts"] = now
         agg["disp_interval"] = max(interval, 0.001)
 
-        # Reset proto counter each interval so dominant_proto reflects current traffic
+        # Reset switch-wide proto counter each interval (used as fallback only).
+        # F5 fix: _src_proto (per-src-ip persistent cache) is intentionally
+        # NEVER cleared — once a src_ip's protocol is seen via PacketIn it stays
+        # known forever across intervals. This is critical for mixed campaigns:
+        # after flow rules install, PacketIn stops firing for that IP, but
+        # _src_proto still returns the correct protocol (ICMP=1, TCP=6, UDP=17)
+        # so RF always gets the right ip_proto, not the switch-wide dominant one.
+        # Only the switch-wide _switch_proto is reset (it's a per-interval tally).
         self._switch_proto[dpid].clear()
 
         total_pkt  = 0
@@ -343,6 +413,23 @@ class FatTreeController(app_manager.RyuApp):
             if "ipv4_dst" in match:
                 dst_ips.add(match["ipv4_dst"])
 
+            # F3 fix: detect blocked flow entries (priority 80/90/100 = drop rules)
+            # and compute delta packets since last poll → real physical drop count.
+            # Push as a separate ZMQ "dropped_delta" message so backend can
+            # accumulate the true malicious_dropped counter accurately.
+            if stat.priority in (80, 90, 100):
+                _blocked_src = match.get("ipv4_src")
+                if _blocked_src:
+                    _prev_pkts = self._blocked_prev_pkts.get(_blocked_src, 0)
+                    _delta     = max(stat.packet_count - _prev_pkts, 0)
+                    self._blocked_prev_pkts[_blocked_src] = stat.packet_count
+                    if _delta > 0:
+                        self._push({
+                            "type":     "dropped_delta",
+                            "src_ip":   _blocked_src,
+                            "delta":    _delta,
+                        })
+
             _total_s = stat.duration_sec + stat.duration_nsec / 1e9
             _total_s = max(_total_s, 1e-9)
             pps  = stat.packet_count / _total_s
@@ -355,10 +442,8 @@ class FatTreeController(app_manager.RyuApp):
                 continue
 
             switch_delta_pps = agg.get("switch_delta_pps", 0.0)
-            # Threshold lowered from 500 → 80 for Mininet VM environments.
-            # In a VM, hping3 --flood achieves 50–500 pps (not 10,000+ like hardware).
-            # 80 safely separates flood (200+ pps) from baseline (< 5 pps total).
-            is_flood_switch  = switch_delta_pps >= 80.0
+            # Lowered from 80 to 20 for faster flood detection in Mininet VM
+            is_flood_switch  = switch_delta_pps >= 20.0
 
             if is_flood_switch:
                 # Flood mode: submit every flow with >= 1 pkt (catches rand-source).
@@ -368,15 +453,26 @@ class FatTreeController(app_manager.RyuApp):
                 if stat.packet_count < 1:
                     continue
             else:
-                # Normal mode: require accumulated evidence before submitting.
-                if stat.packet_count < 50 or pps < 5.0:
+                # Normal mode: minimum 1 packet, cumulative pps >= 0.5
+                # Baseline ping at 1pps starts ~1.0 cumulative pps but drops
+                # toward 0.5 as the flow ages. Worker ML gate (pps < 1.0) still
+                # blocks ML inference — only reporting as normal traffic.
+                if stat.packet_count < 1 or pps < 0.5:
                     continue
 
-            # ICMP fix: read ip_proto directly from OVS flow match per-flow.
-            # PacketIn-based counting always showed ICMP dominant in mixed
-            # campaigns because SYN/UDP get rules installed and stop hitting
-            # the controller. Flow match gives the real protocol per src_ip.
+            # Get ip_proto for this flow:
+            # 1. From OVS flow match (new rules installed with ip_proto in match)
+            # 2. From persistent _src_proto cache (populated by PacketIn, never cleared)
+            # The persistent cache ensures protocol is known even after flow rules
+            # install and PacketIn stops firing for that src_ip.
             _flow_ip_proto = int(match.get("ip_proto", 0))
+            if not _flow_ip_proto:
+                _flow_ip_proto = int(self._src_proto[dpid].get(src_ip, 0))
+            # Last resort: switch-wide dominant proto
+            if not _flow_ip_proto:
+                proto_counts = self._switch_proto.get(dpid, {})
+                if proto_counts:
+                    _flow_ip_proto = max(proto_counts, key=proto_counts.get)
 
             self._push({
                 "type":       "flow_stats",
@@ -476,6 +572,14 @@ class FatTreeController(app_manager.RyuApp):
         src_ip = cmd.get("src_ip")
         ttl    = cmd.get("ttl")   # int seconds or None
 
+        # Maintain _banned_ips so the throttled fast-path can also drop banned packets.
+        if action in ("block", "rate_limit", "quarantine"):
+            self._banned_ips.add(src_ip)
+        elif action == "clear":
+            self._banned_ips.discard(src_ip)
+            # F3 fix: reset drop counter so a re-offending IP starts fresh
+            self._blocked_prev_pkts.pop(src_ip, None)
+
         for dpid, dp in list(self._datapaths.items()):
             parser = dp.ofproto_parser
             ofp    = dp.ofproto
@@ -493,16 +597,19 @@ class FatTreeController(app_manager.RyuApp):
                 dp.send_msg(mod)
 
             elif action == "quarantine":
+                # hard_timeout matches PHASE1_DURATION_HIGH (5s) + 3s buffer = 8s
+                # so OVS rule self-cleans if backend misses the clear command.
                 mod = parser.OFPFlowMod(
                     datapath=dp, priority=90,
-                    idle_timeout=35, hard_timeout=35,
+                    idle_timeout=8, hard_timeout=8,
                     match=match, instructions=[])
                 dp.send_msg(mod)
 
             elif action == "rate_limit":
+                # hard_timeout = quarantine timeout + Phase1 observation = 10s
                 mod = parser.OFPFlowMod(
                     datapath=dp, priority=80,
-                    idle_timeout=70, hard_timeout=70,
+                    idle_timeout=10, hard_timeout=10,
                     match=match, instructions=[])
                 dp.send_msg(mod)
 

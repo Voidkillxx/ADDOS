@@ -157,19 +157,24 @@ async function fetchQuarantine() {
                   : sc >= ifThr       ? 'sc-amb'
                   : 'sc-grn';
       const ttlRemaining = e.ttl_remaining_sec != null
-        ? ` <span style="color:var(--sub);font-size:10px;font-family:var(--mono)">[TTL ${Math.floor(e.ttl_remaining_sec / 60)}m]</span>`
+        ? ` <span style="color:var(--amber,#ffb300);font-size:10px;font-family:var(--mono)">[${Math.floor(e.ttl_remaining_sec/60)}m ${e.ttl_remaining_sec%60}s]</span>`
+        : '';
+
+      // Show priority badge
+      const priBadge = e.priority === 'High'
+        ? `<span class="p-high" style="font-size:11px">HIGH </span>`
         : '';
 
       const inner = `
         <td class="ip">${e.src_ip || '—'}</td>
-        <td style="color:var(--sub2);font-size:11px">${e.phase || '—'}${ttlRemaining}</td>
+        <td style="color:var(--sub2);font-size:12px">${priBadge}${e.phase || '—'}${ttlRemaining}</td>
         <td>${renderVector(e.attack_vector || '—')}</td>
         <td class="${scCls}">${sc.toFixed(4)}</td>
         <td class="mono">${conf}</td>
         <td style="color:var(--sub2);font-family:var(--mono);font-size:11px">${time}</td>
         <td><div style="display:flex;gap:6px">
           <button class="q-btn q-rel" onclick="quarantineAction('release','${e.src_ip}')">Release</button>
-          <button class="q-btn q-blk" onclick="quarantineAction('block','${e.src_ip}')">Block Now</button>
+          <button class="q-btn q-blk" onclick="quarantineAction('block','${e.src_ip}')">Blackhole</button>
         </div></td>`;
 
       if (_qRows.has(e.src_ip)) {
@@ -228,8 +233,8 @@ function addLogRow(ev) {
   const placeholder = tb.querySelector('[colspan]');
   if (placeholder) placeholder.parentElement.remove();
 
-  const ip      = ev.src_ip || '—';
-  const html    = `
+  const ip   = ev.src_ip || '—';
+  const html = `
     <td class="mono">${ev.timestamp      || '—'}</td>
     <td class="ip">${ip}</td>
     <td>${renderClass(ev.predicted_class || '—')}</td>
@@ -238,25 +243,23 @@ function addLogRow(ev) {
     <td>${renderPriority(ev.priority     || 'Low')}</td>
     <td>${renderAction(ev.action_taken   || '—')}</td>`;
 
-  // Bug 3 fix: if this IP already has a row, update it in-place (no duplicate)
   if (_logRows.has(ip)) {
-    const existing = _logRows.get(ip);
-    existing.innerHTML = html;
-    existing.classList.remove('row-in');
-    void existing.offsetWidth; // reflow to restart animation
-    existing.classList.add('row-in');
-    // Move to top
-    tb.insertBefore(existing, tb.firstChild);
-    set('log-ct', logCt.toString());
+    // IP already in log — update columns in-place, no new row
+    const tr = _logRows.get(ip);
+    tr.innerHTML = html;
+    // Flash highlight to show update
+    tr.style.transition = 'background 0.3s';
+    tr.style.background = 'rgba(61,108,255,0.15)';
+    setTimeout(() => { tr.style.background = ''; }, 600);
     return;
   }
 
-  // New IP — add row
+  // New IP — insert row at top
   if (logCt >= MAX_LOG) {
     const oldest = tb.querySelector('tr:last-child');
     if (oldest) {
       const oldIp = oldest.querySelector('.ip');
-      if (oldIp) _logRows.delete(oldIp.textContent);
+      if (oldIp) _logRows.delete(oldIp.textContent.trim());
       oldest.remove();
     }
   } else {
@@ -345,7 +348,13 @@ function renderVector(v) {
 }
 
 function renderAction(v) {
-  const map = { 'Quarantined': 't-q', 'Rate Limited': 't-rl', 'Blocked': 't-blocked' };
+  const map = {
+    'Quarantined': 't-q',
+    'Rate Limited': 't-rl',
+    'Time Ban':    't-ban',
+    'Blackhole':   't-blocked',
+    'Blocked':     't-blocked',
+  };
   return map[v] ? mkTag(map[v], v) : `<span style="color:var(--sub2)">${v}</span>`;
 }
 
@@ -457,7 +466,9 @@ function _renderCal(which) {
     const hasData = _calDates.has(ds);
     const isSel   = ds === s.selected;
     const isToday = ds === todayS;
-    const disabled = isFut || !hasData;
+    // Only disable future dates — past/today always selectable
+    // History dot shown only on dates with actual attack data
+    const disabled = isFut;
 
     let cls = 'cal-day';
     if (disabled) cls += ' cal-disabled';

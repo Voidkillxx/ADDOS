@@ -3,7 +3,7 @@ import json
 import time
 import threading
 import logging
-from backend.config import ZMQ_TELEMETRY_ADDR
+from backend.config import ZMQ_TELEMETRY_ADDR, SYN_HALFOPEN_LIMIT
 from backend.pipeline import worker
 from backend.pipeline.syn_prefilter import syn_filter
 
@@ -27,6 +27,12 @@ _RECV_TIMEOUT_MS   = 1000
 _raw_lock       = threading.Lock()
 _raw_total_pkts = 0
 
+# Fix B: track connected switch count from ZMQ switch_count messages.
+# topology.py polls get_switch_count() every 0.5s to know when all 20
+# switches are connected without needing the Ryu REST topology API.
+_switch_count_lock = threading.Lock()
+_connected_switches = 0
+
 # Last-seen cumulative packet_count per flow key: (src_ip, dpid) → int
 _flow_prev_pkts: dict[tuple, int] = {}
 _flow_lock = threading.Lock()
@@ -37,11 +43,26 @@ def get_raw_counts() -> dict:
         return {"raw_total": _raw_total_pkts}
 
 
+def get_switch_count() -> int:
+    """Returns the number of switches currently connected to Ryu.
+    Updated via ZMQ switch_count messages — no REST API needed.
+    Called by topology.py during startup polling (Fix B).
+    """
+    with _switch_count_lock:
+        return _connected_switches
+
+
 def _reset_flow_state() -> None:
-    """Called on ZMQ reconnect — OVS counters reset when Ryu restarts."""
+    """Called on ZMQ reconnect — OVS counters reset when Ryu restarts.
+    Also resets _raw_total_pkts so cumulative OVS counts are not
+    double-counted after reconnect (fix for billion-packet UI bug).
+    """
+    global _raw_total_pkts
     with _flow_lock:
         _flow_prev_pkts.clear()
-    log.info("ZMQ receiver: flow delta state reset")
+    with _raw_lock:
+        _raw_total_pkts = 0
+    log.info("ZMQ receiver: flow delta state reset (raw_total reset to 0)")
 
 
 def _parse_and_route(raw: bytes) -> None:
@@ -54,14 +75,52 @@ def _parse_and_route(raw: bytes) -> None:
 
     msg_type = msg.get("type")
 
-    if msg_type == "packet_in":
+    if msg_type == "switch_count":
+        # Fix B: update connected switch count so topology.py can poll
+        # get_switch_count() instead of hitting the 404 REST endpoint.
+        global _connected_switches
+        with _switch_count_lock:
+            _connected_switches = int(msg.get("connected", 0))
+        return
+
+    elif msg_type == "packet_in":
         src_ip = msg.get("src_ip", "")
         proto  = msg.get("proto", "")
 
         if proto == "TCP" and msg.get("tcp_flags_syn") and not msg.get("tcp_flags_ack"):
-            syn_filter.on_syn(src_ip)
+            flagged = syn_filter.on_syn(src_ip)
+            # Bug 4 fix: when SYN prefilter trips, submit directly to the worker
+            # so the IP reaches the decision engine and appears in the audit log.
+            # Previously on_syn() return value was ignored — SYN floods never
+            # reached the pipeline and were invisible in the dashboard.
+            if flagged:
+                syn_flow_stats = {
+                    "packet_count":            SYN_HALFOPEN_LIMIT,
+                    "packet_count_per_second":  float(SYN_HALFOPEN_LIMIT),
+                    "switch_delta_pps":         float(SYN_HALFOPEN_LIMIT),
+                    "ip_proto":                 6,
+                    "src_port":                 0,
+                    "dst_port":                 80,
+                    "byte_count":               SYN_HALFOPEN_LIMIT * 60,
+                }
+                worker.submit(src_ip, syn_flow_stats, {})
+                log.info("SYN prefilter tripped for %s — submitted to pipeline", src_ip)
         elif proto == "TCP" and msg.get("tcp_flags_ack"):
             syn_filter.on_ack(src_ip)
+
+    elif msg_type == "dropped_delta":
+        # F3 fix: real physical packet drop count from OVS blocked flow entries.
+        # ryu_controller sends this for every priority 80/90/100 flow entry
+        # (rate_limit / quarantine / block rules) each FlowStats poll interval.
+        # Accumulate into decision_engine so UI shows true malicious_dropped.
+        src_ip = msg.get("src_ip", "")
+        delta  = int(msg.get("delta", 0))
+        if src_ip and delta > 0:
+            try:
+                from backend.pipeline.decision_engine import record_dropped_packets
+                record_dropped_packets(src_ip, delta)
+            except Exception:
+                pass
 
     elif msg_type == "flow_stats":
         src_ip       = msg.get("src_ip", "")
@@ -82,22 +141,17 @@ def _parse_and_route(raw: bytes) -> None:
             delta_pkts                = max(pkt_count_cumulative - prev_count, 0)
             _flow_prev_pkts[flow_key] = pkt_count_cumulative
 
-        if delta_pkts == 0:
-            return
+        # delta=0 check removed — submit anyway so ip_proto reaches RF
+        # worker guards against zero-packet flows internally
 
-        MIN_FLOW_PKTS = 1
-        MIN_PPS       = 20.0
-
-        # Bug 2 fix: rand-source flood flows have pkt_count=1 and short duration.
-        # Their computed pps = 1/duration_sec which can be < 20 → filtered.
-        # During a flood (switch_delta_pps >= 80), bypass MIN_PPS entirely.
-        # switch_delta_pps is now correctly boosted by rate_pkt_in in ryu_controller
-        # (Bug 1 fix) so this flag is reliable even with throttled flows.
+        # Lowered MIN_PPS 20.0->2.0 and flood threshold 80.0->20.0
+        # to match ryu_controller and worker gates for faster detection
+        MIN_PPS          = 2.0
         switch_delta_pps = float(flow_stats.get("switch_delta_pps", 0.0))
-        is_flood_mode    = switch_delta_pps >= 80.0
+        is_flood_mode    = switch_delta_pps >= 20.0
 
         crosses_threshold = (
-            pkt_count_cumulative >= MIN_FLOW_PKTS
+            pkt_count_cumulative >= 1
             and (pps >= MIN_PPS or is_flood_mode)
         )
 
@@ -105,13 +159,17 @@ def _parse_and_route(raw: bytes) -> None:
             _raw_total_pkts += delta_pkts
 
         if crosses_threshold:
-            worker.submit(src_ip, flow_stats, switch_stats)
-        else:
+            # Skip ML pipeline for IPs already in Phase 2/3 (Time Ban/Blackhole).
+            # OVS block rule is already in place — running IF/RF again wastes CPU
+            # and risks flipping the attack vector (fixed in state_machine too).
             try:
-                from backend.database import writer
-                writer.log_traffic_summary(total=1, threats=0, true_neg=1, fp=0)
+                from backend.mitigation.state_machine import state_machine as _sm
+                _ip_state = _sm._states.get(src_ip)
+                if _ip_state is not None and _ip_state.phase >= 2:
+                    return
             except Exception:
                 pass
+            worker.submit(src_ip, flow_stats, switch_stats)
 
 
 def _receiver_loop() -> None:

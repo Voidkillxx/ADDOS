@@ -22,6 +22,5 @@
   "anomaly_rule": "is_anomaly = (if_score >= threshold)",
   "contamination": 0.01,
   "trained_on": "NORMAL only (label=1)",
-  "label_convention": "1=Normal, 0=Attack",
-  "dataset": "SNT + Mininet augmentation (flow_duration up to 2230s)"
+  "label_convention": "1=Normal, 0=Attack"
 }

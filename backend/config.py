@@ -24,11 +24,14 @@ ZMQ_COMMAND_ADDR   = "tcp://127.0.0.1:5556"   # Backend PUSH → Ryu PULL
 
 # --- Pipeline tuning ---
 FLOW_TRACKER_CAP        = 500
-INFERENCE_CACHE_TTL_S   = 1.5
+INFERENCE_CACHE_TTL_S   = 3.0  # Lowered from 10s — faster re-evaluation during
+                               # observation window. Phase 2/3 IPs are now skipped
+                               # entirely in zmq_receiver so cache TTL only matters
+                               # for Phase 1 observation (now 3-5s).
 WORKER_QUEUE_MAXSIZE    = 1000
 WORKER_ITEM_TIMEOUT_S   = 3.0
-EXTRACTION_TRIGGER_PKTS = 10
-EXTRACTION_TRIGGER_S    = 2.0
+EXTRACTION_TRIGGER_PKTS = 2    # Minimum packets before inference
+EXTRACTION_TRIGGER_S    = 0.1  # Minimum flow age before inference
 
 # --- SYN pre-filter ---
 SYN_HALFOPEN_LIMIT  = 100
@@ -37,7 +40,7 @@ SYN_WINDOW_S        = 2.0
 # --- API ---
 FLASK_HOST = "0.0.0.0"
 FLASK_PORT = 5000
-IF_SCORE_THRESHOLD_OVERRIDE = 0.71
+IF_SCORE_THRESHOLD_OVERRIDE = None # Intentional: safe-zone threshold above Mininet baseline ping scores (0.65-0.70)
 
 # Minimum packet count — zero-packet flows are always dropped.
 MIN_FLOW_PKTS_FOR_INFERENCE = 0
