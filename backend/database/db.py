@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import threading
+from contextlib import contextmanager
 from backend.config import DB_PATH
 
 _lock = threading.Lock()
@@ -17,6 +18,7 @@ def get_connection() -> sqlite3.Connection:
                 _conn.execute("PRAGMA journal_mode=WAL")
                 _conn.execute("PRAGMA synchronous=NORMAL")
                 _init_schema(_conn)
+                _migrate(_conn)
                 _conn.commit()
     return _conn
 
@@ -65,7 +67,6 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_summary_ts   ON traffic_summary(timestamp);
         CREATE INDEX IF NOT EXISTS idx_archive_ts   ON mitigation_events_archive(timestamp);
 
-        -- ── detection_features — all IF + RF features + binary attack-type flags ──
         CREATE TABLE IF NOT EXISTS detection_features (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp   TEXT    NOT NULL,
@@ -75,7 +76,6 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             attack_class TEXT   NOT NULL,
             confidence  REAL    NOT NULL,
 
-            -- IF features (feature_contract.json)
             flow_duration_sec        REAL,
             flow_duration_nsec       REAL,
             idle_timeout             INTEGER,
@@ -91,7 +91,6 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             bytes_per_packet         REAL,
             pkt_byte_rate_ratio      REAL,
 
-            -- RF / switch-level features (rf_sdn_feature_contract.json)
             disp_pakt            INTEGER,
             disp_byte            INTEGER,
             mean_pkt             REAL,
@@ -110,7 +109,6 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             flow_entry_ratio     REAL,
             mean_pkt_byte_ratio  REAL,
 
-            -- Binary attack-type flags (exactly one = 1)
             flag_syn_flood   INTEGER NOT NULL DEFAULT 0,
             flag_icmp_flood  INTEGER NOT NULL DEFAULT 0,
             flag_udp_flood   INTEGER NOT NULL DEFAULT 0,
@@ -124,21 +122,46 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_df_attack_class
             ON detection_features (attack_class);
 
-        -- ── quarantine_state — persists active mitigations across restarts ──
+        -- quarantine_state — block_expires_at TEXT added for TTL persistence.
+        -- NULL = permanent (manual block). ISO timestamp = auto-block expiry.
         CREATE TABLE IF NOT EXISTS quarantine_state (
-            src_ip        TEXT PRIMARY KEY,
-            phase         INTEGER NOT NULL,
-            attack_vector TEXT    NOT NULL,
-            if_score      REAL    NOT NULL,
-            confidence    REAL    NOT NULL,
-            action_taken  TEXT    NOT NULL,
-            permanent     INTEGER NOT NULL DEFAULT 0,
-            updated_at    TEXT    NOT NULL
+            src_ip           TEXT PRIMARY KEY,
+            phase            INTEGER NOT NULL,
+            attack_vector    TEXT    NOT NULL,
+            if_score         REAL    NOT NULL,
+            confidence       REAL    NOT NULL,
+            action_taken     TEXT    NOT NULL,
+            permanent        INTEGER NOT NULL DEFAULT 0,
+            updated_at       TEXT    NOT NULL,
+            block_expires_at TEXT
         );
 
-        -- ── global_counters — single-row all-time accumulator ─────────────────
-        -- Never resets. Written to on every pipeline cycle so stats survive
-        -- server restarts. Row id=1 is always the one and only record.
+        -- ip_attack_history: one row per IP per attack session.
+        -- Written when an IP is unblocked (TTL expiry, manual release, or escalation).
+        -- Used for history view and report generation by date range.
+        CREATE TABLE IF NOT EXISTS ip_attack_history (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            src_ip          TEXT    NOT NULL,
+            attack_vector   TEXT    NOT NULL,
+            if_score        REAL    NOT NULL,
+            confidence      REAL    NOT NULL,
+            priority        TEXT    NOT NULL DEFAULT 'Low',
+            phase_reached   INTEGER NOT NULL DEFAULT 1,
+            first_seen      TEXT    NOT NULL,
+            unblocked_at    TEXT    NOT NULL,
+            duration_sec    INTEGER NOT NULL DEFAULT 0,
+            unblock_reason  TEXT    NOT NULL,
+            ban_level       INTEGER NOT NULL DEFAULT 0,
+            offence_count   INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_history_ip
+            ON ip_attack_history (src_ip);
+        CREATE INDEX IF NOT EXISTS idx_history_unblocked
+            ON ip_attack_history (unblocked_at);
+        CREATE INDEX IF NOT EXISTS idx_history_date
+            ON ip_attack_history (date(unblocked_at));
+
         CREATE TABLE IF NOT EXISTS global_counters (
             id               INTEGER PRIMARY KEY CHECK (id = 1),
             total_packets    INTEGER NOT NULL DEFAULT 0,
@@ -147,10 +170,62 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             false_positives  INTEGER NOT NULL DEFAULT 0
         );
 
-        -- Seed the single row so UPDATE always finds a target
-        INSERT OR IGNORE INTO global_counters (id, total_packets, malicious_dropped, normal_packets, false_positives)
+        INSERT OR IGNORE INTO global_counters
+            (id, total_packets, malicious_dropped, normal_packets, false_positives)
         VALUES (1, 0, 0, 0, 0);
     """)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Safe schema migrations for existing databases.
+
+    Each ALTER TABLE is wrapped in try/except so re-running on a fresh DB
+    (which already has the column from _init_schema) is a no-op.
+    """
+    # H5 fix: add block_expires_at to existing quarantine_state tables.
+    try:
+        conn.execute("ALTER TABLE quarantine_state ADD COLUMN block_expires_at TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE ip_attack_history ADD COLUMN ban_level INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE ip_attack_history ADD COLUMN offence_count INTEGER NOT NULL DEFAULT 1")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# C3 fix: atomic transaction context manager
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def transaction():
+    """Context manager for multi-statement atomic transactions.
+
+    Usage::
+
+        with transaction() as conn:
+            conn.execute("INSERT INTO ...", (...))
+            conn.execute("DELETE FROM ...", (...))
+        # commits on __exit__, rolls back on exception
+
+    Holds _lock for the duration — do not nest with execute() or query().
+    """
+    conn = get_connection()
+    with _lock:
+        conn.execute("BEGIN")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def execute(sql: str, params: tuple = ()) -> sqlite3.Cursor:
@@ -176,29 +251,3 @@ def query(sql: str, params: tuple = ()) -> list[dict]:
         rows = [dict(r) for r in cur.fetchall()]
         conn.row_factory = None
         return rows
-
-
-def increment_global_counters(
-    total: int = 0,
-    malicious: int = 0,
-    normal: int = 0,
-    fp: int = 0,
-) -> None:
-    """Atomically add to the persistent all-time counters.
-
-    Call this from decision_engine (or wherever traffic_summary is written)
-    to keep global_counters in sync alongside traffic_summary.
-
-    Example usage in decision_engine::
-
-        from backend.database.db import increment_global_counters
-        increment_global_counters(total=1, malicious=1)
-    """
-    execute("""
-        UPDATE global_counters
-        SET total_packets     = total_packets     + ?,
-            malicious_dropped = malicious_dropped + ?,
-            normal_packets    = normal_packets    + ?,
-            false_positives   = false_positives   + ?
-        WHERE id = 1
-    """, (total, malicious, normal, fp))

@@ -24,11 +24,11 @@ class InferenceCacheEntry:
 
     def __init__(self, if_score: float, is_anomaly: bool,
                  attack_class: str, confidence: float):
-        self.if_score    = if_score
-        self.is_anomaly  = is_anomaly
+        self.if_score     = if_score
+        self.is_anomaly   = is_anomaly
         self.attack_class = attack_class
-        self.confidence  = confidence
-        self.expires_at  = time.monotonic() + INFERENCE_CACHE_TTL_S
+        self.confidence   = confidence
+        self.expires_at   = time.monotonic() + INFERENCE_CACHE_TTL_S
 
     def is_valid(self) -> bool:
         return time.monotonic() < self.expires_at
@@ -37,15 +37,15 @@ class InferenceCacheEntry:
 class FlowTracker:
     """Tracks active flows per src_ip with a 500-entry cap.
 
-    Also maintains a 3-second inference result cache keyed by src_ip
-    so the ML pipeline is not re-invoked for every packet burst.
+    H6 fix: _cache is now protected by the same _lock as _flows.
+    Previously cache operations had no lock — safe with a single worker
+    thread but a latent race condition for any future second worker.
     """
 
     def __init__(self):
         self._lock   = threading.Lock()
-        # OrderedDict preserves insertion order for LRU-style eviction
-        self._flows: OrderedDict[str, FlowEntry]         = OrderedDict()
-        self._cache: dict[str, InferenceCacheEntry]      = {}
+        self._flows: OrderedDict[str, FlowEntry]    = OrderedDict()
+        self._cache: dict[str, InferenceCacheEntry] = {}
 
     # ------------------------------------------------------------------
     # Flow tracking
@@ -58,7 +58,6 @@ class FlowTracker:
                 self._flows.move_to_end(src_ip)
             else:
                 if len(self._flows) >= FLOW_TRACKER_CAP:
-                    # Evict the oldest entry
                     self._flows.popitem(last=False)
                 self._flows[src_ip] = FlowEntry(flow_stats)
             return self._flows[src_ip]
@@ -76,31 +75,34 @@ class FlowTracker:
             return len(self._flows)
 
     # ------------------------------------------------------------------
-    # Inference cache
+    # Inference cache — H6: all operations now lock-protected
     # ------------------------------------------------------------------
 
     def get_cached(self, src_ip: str) -> InferenceCacheEntry | None:
-        entry = self._cache.get(src_ip)
-        if entry and entry.is_valid():
-            return entry
-        # Expired — remove it
-        self._cache.pop(src_ip, None)
-        return None
+        with self._lock:
+            entry = self._cache.get(src_ip)
+            if entry and entry.is_valid():
+                return entry
+            self._cache.pop(src_ip, None)
+            return None
 
     def set_cache(self, src_ip: str, if_score: float, is_anomaly: bool,
                   attack_class: str, confidence: float) -> None:
-        self._cache[src_ip] = InferenceCacheEntry(
-            if_score, is_anomaly, attack_class, confidence
-        )
+        with self._lock:
+            self._cache[src_ip] = InferenceCacheEntry(
+                if_score, is_anomaly, attack_class, confidence
+            )
 
     def invalidate_cache(self, src_ip: str) -> None:
-        self._cache.pop(src_ip, None)
+        with self._lock:
+            self._cache.pop(src_ip, None)
 
     def purge_expired_cache(self) -> None:
         now = time.monotonic()
-        expired = [ip for ip, e in self._cache.items() if now >= e.expires_at]
-        for ip in expired:
-            del self._cache[ip]
+        with self._lock:
+            expired = [ip for ip, e in self._cache.items() if now >= e.expires_at]
+            for ip in expired:
+                del self._cache[ip]
 
 
 # Module-level singleton shared across pipeline components

@@ -3,9 +3,9 @@ import threading
 from backend.models import loader
 
 # Per-feature running median tracker for NaN fill
-_median_lock   = threading.Lock()
-_feature_sums  = None
-_feature_counts = None
+_median_lock     = threading.Lock()
+_feature_sums    = None
+_feature_counts  = None
 _feature_medians = None
 
 
@@ -41,27 +41,25 @@ def extract_if_features(flow_stats: dict) -> np.ndarray:
 
     s = flow_stats
 
-    # --- Raw fields [0]–[10] ---
-    fds  = float(s.get("flow_duration_sec",        0))
-    fdns = float(s.get("flow_duration_nsec",        0))
-    ito  = float(s.get("idle_timeout",              0))
-    hto  = float(s.get("hard_timeout",              0))
-    flg  = float(s.get("flags",                     0))
+    # --- Raw fields ---
+    fds  = float(s.get("flow_duration_sec",  0))
+    fdns = float(s.get("flow_duration_nsec", 0))
+    ito  = float(s.get("idle_timeout",       0))
+    hto  = float(s.get("hard_timeout",       0))
+    flg  = float(s.get("flags",              0))
 
-    pkt_raw  = float(s.get("packet_count",              0))
-    byt_raw  = float(s.get("byte_count",                0))
-    # ── Recompute rates using exact same formula as sdn_collector_controller ─
-    # ryu_controller now sends rates already computed this way, but we
-    # recompute here from raw packet/byte/duration fields to be safe and
-    # guarantee the feature vector always matches what the scaler was fitted on.
+    pkt_raw = float(s.get("packet_count", 0))
+    byt_raw = float(s.get("byte_count",   0))
+
+    # Recompute rates using exact same formula as sdn_collector_controller
     _total_s = fds + fdns / 1e9
     _total_s = max(_total_s, 1e-9)
-    pps_raw  = pkt_raw / _total_s             # collector: pkt_cnt / total
-    bps_raw  = byt_raw / _total_s             # collector: byt_cnt / total
-    ppns_raw = pps_raw / 1e9                  # collector: pps / 1e9
-    bpns_raw = bps_raw / 1e9                  # collector: bps / 1e9
+    pps_raw  = pkt_raw / _total_s        # packet_count_per_second
+    bps_raw  = byt_raw / _total_s        # byte_count_per_second
+    ppns_raw = pps_raw / 1e9             # packet_count_per_nsecond
+    bpns_raw = bps_raw / 1e9             # byte_count_per_nsecond
 
-    # [5]–[10]: log1p-transformed (matches training preprocess step)
+    # log1p-transformed (matches training preprocess step)
     pkt_log  = np.log1p(max(pkt_raw,  0))
     byt_log  = np.log1p(max(byt_raw,  0))
     pps_log  = np.log1p(max(pps_raw,  0))
@@ -69,17 +67,22 @@ def extract_if_features(flow_stats: dict) -> np.ndarray:
     bps_log  = np.log1p(max(bps_raw,  0))
     bpns_log = np.log1p(max(bpns_raw, 0))
 
-    # --- Engineered [11]–[13] — matches training preprocess exactly ---
-    # [11] flow_duration_total_ns
+    # Engineered features
+    # flow_duration_total_ns
     fdt_raw = fds * 1e9 + fdns
     fdt     = np.log1p(max(fdt_raw, 0))
 
-    # [12] bytes_per_packet — log1p(byte_count / packet_count)
+    # bytes_per_packet
     bpp = np.log1p(max(byt_raw / (pkt_raw + 1e-9), 0))
 
-    # [13] pkt_byte_rate_ratio — log1p(pps / bps)
+    # pkt_byte_rate_ratio
     pbr = np.log1p(max(pps_raw / (bps_raw + 1e-9), 0))
 
+    # 14 features matching scaler fitted feature order exactly:
+    # flow_duration_sec, flow_duration_nsec, idle_timeout, hard_timeout, flags,
+    # packet_count, byte_count, packet_count_per_second, packet_count_per_nsecond,
+    # byte_count_per_second, byte_count_per_nsecond,
+    # flow_duration_total_ns, bytes_per_packet, pkt_byte_rate_ratio
     vec = np.array([
         fds, fdns, ito, hto, flg,
         pkt_log, byt_log, pps_log, ppns_log, bps_log, bpns_log,

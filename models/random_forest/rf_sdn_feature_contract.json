@@ -12,6 +12,7 @@
     "g_usip",
     "rfip",
     "gsp",
+    "ip_proto",
     "flow_duration_total_ns",
     "bytes_per_packet",
     "pkt_byte_rate_ratio",
@@ -24,14 +25,15 @@
     "mean_byte_raw",
     "pkt_size_bucket"
   ],
-  "n_features": 23,
+  "n_features": 24,
   "class_names": [
     "ICMP Flood",
     "SYN Flood",
     "UDP Flood"
   ],
   "n_classes": 3,
-  "dataset": "dataset_new (Mendeley SDN DDoS) \u2014 SDN_DDOS_dataset.csv excluded",
+  "dataset": "FLOOD files only: ICMP_FLOOD, SYN_FLOOD, UDP_FLOOD",
+  "confidence_gate": 0.5,
   "rf_core_engineered_features": [
     "flow_duration_total_ns",
     "bytes_per_packet",
@@ -49,7 +51,5 @@
     "mean_byte_raw",
     "pkt_size_bucket"
   ],
-  "confidence_gate": 0.55,
-  "note": "3-class RF: ICMP Flood, SYN Flood, UDP Flood. SDN_DDOS_dataset.csv excluded (duplicate of individual CSVs). Unknown/zero-day attacks handled by confidence gate: if rf_conf < 0.55 \u2192 report as 'Uncertain'.",
-  "usage": "import joblib; model=joblib.load('random_forest_sdn_final.pkl'); scaler=joblib.load('scaler.pkl'); le=joblib.load('label_encoder.pkl'); proba=model.predict_proba(scaler.transform(X)); pred=le.inverse_transform(proba.argmax(axis=1)); conf=proba.max(axis=1); final=[p if c>=0.55 else 'Uncertain' for p,c in zip(pred,conf)]"
+  "note": "Retrained on FLOOD-only files. confidence_gate=0.50. ip_proto injected from flow at inference."
 }

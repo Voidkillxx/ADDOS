@@ -5,24 +5,19 @@ from backend.pipeline.decision_engine import drain_sse_events
 
 bp = Blueprint("events", __name__)
 
-# Audit log cap — only the latest 100 events are kept per SSE session
-_AUDIT_CAP = 100
-
 
 @bp.get("/api/events")
 def events():
     def _stream():
-        session_log = []
+        # M8 fix: session_log was accumulated (up to 100 entries) and trimmed,
+        # but was never yielded to the client — only new_events were sent.
+        # The server-side cap was dead code; the real cap is MAX_LOG=100 in
+        # main.js.  Reconnecting SSE clients also got no replay, so the
+        # accumulated list served no purpose at all.  Removed.
         while True:
             new_events = drain_sse_events()
-            if new_events:
-                session_log.extend(new_events)
-                # Enforce 100-event cap — discard oldest beyond limit
-                if len(session_log) > _AUDIT_CAP:
-                    session_log = session_log[-_AUDIT_CAP:]
-                for event in new_events:
-                    yield f"data: {json.dumps(event)}\n\n"
-            # UI batch interval — push every 500ms per spec
+            for event in new_events:
+                yield f"data: {json.dumps(event)}\n\n"
             time.sleep(0.5)
 
     return Response(
@@ -30,6 +25,6 @@ def events():
         mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # disable nginx buffering if behind proxy
+            "X-Accel-Buffering": "no",
         },
     )

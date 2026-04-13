@@ -6,12 +6,11 @@ from backend.database.db import execute, executemany
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Dedup cache — prevents writing identical detections multiple times per second
-# Cache key: (src_ip, round(if_score,4), action_taken)  TTL: 10 seconds
+# Dedup cache
 # ---------------------------------------------------------------------------
 _dedup_lock  = threading.Lock()
-_dedup_cache: dict[tuple, float] = {}   # key → last_written_monotonic
-_DEDUP_TTL   = 10.0   # seconds
+_dedup_cache: dict[tuple, float] = {}
+_DEDUP_TTL   = 10.0
 
 import time as _time
 
@@ -19,7 +18,6 @@ def _is_duplicate(src_ip: str, if_score: float, action_taken: str) -> bool:
     key = (src_ip, round(if_score, 4), action_taken)
     now = _time.monotonic()
     with _dedup_lock:
-        # Purge expired entries
         expired = [k for k, t in _dedup_cache.items() if now - t > _DEDUP_TTL]
         for k in expired:
             del _dedup_cache[k]
@@ -41,7 +39,6 @@ _summary_buffer = {"total": 0, "threats": 0, "true_neg": 0, "fp": 0}
 # ---------------------------------------------------------------------------
 
 def log_mitigation_event(event: dict) -> None:
-    # Dedup: skip if same src_ip + if_score + action written within TTL
     if _is_duplicate(
         event.get("src_ip", ""),
         event.get("if_score", 0.0),
@@ -89,7 +86,7 @@ def log_manual_action(src_ip: str, action: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# detection_features — all IF + RF features + attack type flags
+# detection_features
 # ---------------------------------------------------------------------------
 
 def log_detection_features(src_ip: str, if_score: float,
@@ -97,13 +94,11 @@ def log_detection_features(src_ip: str, if_score: float,
                             confidence: float,
                             flow_stats: dict,
                             switch_stats: dict) -> None:
-    """Logs all ML features + binary attack-type flags for every inference."""
     try:
         fs = flow_stats  or {}
         ss = switch_stats or {}
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # --- IF features (from feature_contract.json) ---
         flow_duration_sec         = fs.get("flow_duration_sec", 0.0)
         flow_duration_nsec        = fs.get("flow_duration_nsec", 0.0)
         idle_timeout              = fs.get("idle_timeout", 0)
@@ -121,7 +116,6 @@ def log_detection_features(src_ip: str, if_score: float,
         pkt_byte_rate_ratio       = (packet_count_per_second /
                                      max(byte_count_per_second, 1e-9))
 
-        # --- RF / switch-level features (from rf_sdn_feature_contract.json) ---
         disp_pakt         = ss.get("disp_pakt", 0)
         disp_byte         = ss.get("disp_byte", 0)
         mean_pkt          = ss.get("mean_pkt", 0.0)
@@ -140,7 +134,6 @@ def log_detection_features(src_ip: str, if_score: float,
         flow_entry_ratio   = (gfe / max(gsp, 1))
         mean_pkt_byte_ratio = (mean_pkt / max(mean_byte, 1e-9))
 
-        # --- Attack type flags (binary 0/1, exactly one = 1) ---
         flag_syn_flood  = 1 if attack_class == "SYN Flood"  else 0
         flag_icmp_flood = 1 if attack_class == "ICMP Flood" else 0
         flag_udp_flood  = 1 if attack_class == "UDP Flood"  else 0
@@ -191,29 +184,37 @@ def log_detection_features(src_ip: str, if_score: float,
 
 
 # ---------------------------------------------------------------------------
-# quarantine_state — persists active mitigations across restarts
+# quarantine_state
 # ---------------------------------------------------------------------------
 
 def save_quarantine_state(src_ip: str, phase: int, attack_vector: str,
                           if_score: float, confidence: float,
-                          action_taken: str, permanent: bool) -> None:
+                          action_taken: str, permanent: bool,
+                          block_expires_at: str | None = None) -> None:
+    """Persist quarantine state.
+
+    H5 fix: block_expires_at (ISO timestamp string) stores TTL expiry for
+    auto-blocks so it survives backend restarts.  NULL = manual permanent block.
+    """
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         execute("""
             INSERT INTO quarantine_state
                 (src_ip, phase, attack_vector, if_score, confidence,
-                 action_taken, permanent, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 action_taken, permanent, updated_at, block_expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(src_ip) DO UPDATE SET
-                phase         = excluded.phase,
-                attack_vector = excluded.attack_vector,
-                if_score      = excluded.if_score,
-                confidence    = excluded.confidence,
-                action_taken  = excluded.action_taken,
-                permanent     = excluded.permanent,
-                updated_at    = excluded.updated_at
+                phase            = excluded.phase,
+                attack_vector    = excluded.attack_vector,
+                if_score         = excluded.if_score,
+                confidence       = excluded.confidence,
+                action_taken     = excluded.action_taken,
+                permanent        = excluded.permanent,
+                updated_at       = excluded.updated_at,
+                block_expires_at = excluded.block_expires_at
         """, (src_ip, phase, attack_vector, round(if_score, 6),
-              round(confidence, 6), action_taken, int(permanent), ts))
+              round(confidence, 6), action_taken, int(permanent), ts,
+              block_expires_at))
     except Exception:
         log.exception("Failed to save quarantine state for %s", src_ip)
 
@@ -231,41 +232,13 @@ def load_quarantine_states() -> list[dict]:
         from backend.database.db import query
         rows = query("""
             SELECT src_ip, phase, attack_vector, if_score, confidence,
-                   action_taken, permanent
+                   action_taken, permanent, block_expires_at
             FROM quarantine_state
         """)
         return [dict(r) for r in rows] if rows else []
     except Exception:
         log.exception("Failed to load quarantine states")
         return []
-
-
-# ---------------------------------------------------------------------------
-# Startup counter seeding — reads session totals from DB
-# ---------------------------------------------------------------------------
-
-def get_session_totals() -> dict:
-    """Returns cumulative totals from mitigation_events for counter seeding."""
-    try:
-        from backend.database.db import query
-        row = query("""
-            SELECT
-                COUNT(*)                                      AS total_packets,
-                SUM(CASE WHEN is_manual=0 THEN 1 ELSE 0 END) AS malicious_dropped,
-                0                                             AS normal_packets
-            FROM mitigation_events
-            WHERE is_manual = 0
-        """)
-        if row:
-            r = dict(row[0])
-            return {
-                "total_packets":     r.get("total_packets", 0) or 0,
-                "malicious_dropped": r.get("malicious_dropped", 0) or 0,
-                "normal_packets":    r.get("normal_packets", 0) or 0,
-            }
-    except Exception:
-        log.exception("Failed to get session totals")
-    return {"total_packets": 0, "malicious_dropped": 0, "normal_packets": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +256,11 @@ def log_traffic_summary(total: int, threats: int,
 
 def flush_summary() -> None:
     with _summary_lock:
-        if _summary_buffer["total"] == 0:
+        # H4 / flush guard fix: old guard checked only total==0, so FP-only
+        # entries (total=0, fp=1) from record_false_positive were silently
+        # dropped and never written to the DB — making the PDF report always
+        # show 0.00% FP rate.  Now flush if ANY counter is non-zero.
+        if not any(_summary_buffer.values()):
             return
         snapshot = _summary_buffer.copy()
         _summary_buffer.update({"total": 0, "threats": 0, "true_neg": 0, "fp": 0})
@@ -311,3 +288,61 @@ def start_flush_thread() -> None:
 
     t = threading.Thread(target=_loop, name="summary-flush", daemon=True)
     t.start()
+
+# ---------------------------------------------------------------------------
+# ip_attack_history — one record per IP per attack session
+# ---------------------------------------------------------------------------
+
+def log_attack_history(src_ip: str, attack_vector: str, if_score: float,
+                       confidence: float, priority: str, phase_reached: int,
+                       first_seen: str, unblock_reason: str,
+                       ban_level: int = 0, offence_count: int = 1) -> None:
+    """Write a completed attack session to ip_attack_history.
+
+    Called by state_machine._clear() (TTL expiry) and manual_release().
+    first_seen: ISO timestamp when IP entered phase 1.
+    unblock_reason: 'TTL Expired' | 'Manual Release' | 'Manual Block Escalation'
+    """
+    unblocked_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        first_dt   = datetime.datetime.strptime(first_seen, "%Y-%m-%d %H:%M:%S")
+        last_dt    = datetime.datetime.strptime(unblocked_at, "%Y-%m-%d %H:%M:%S")
+        duration_s = int((last_dt - first_dt).total_seconds())
+    except Exception:
+        duration_s = 0
+
+    try:
+        execute("""
+            INSERT INTO ip_attack_history
+                (src_ip, attack_vector, if_score, confidence, priority,
+                 phase_reached, first_seen, unblocked_at, duration_sec, unblock_reason,
+                 ban_level, offence_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            src_ip,
+            attack_vector,
+            round(if_score, 6),
+            round(confidence, 6),
+            priority,
+            phase_reached,
+            first_seen,
+            unblocked_at,
+            duration_s,
+            unblock_reason,
+            ban_level,
+            offence_count,
+        ))
+    except Exception:
+        log.exception("Failed to write attack history for %s", src_ip)
+
+
+def get_history_dates() -> list[str]:
+    """Return distinct dates (YYYY-MM-DD) that have attack history records."""
+    try:
+        rows = query(
+            "SELECT DISTINCT date(unblocked_at) AS d FROM ip_attack_history ORDER BY d ASC"
+        )
+        return [r["d"] for r in rows if r["d"]]
+    except Exception:
+        log.exception("Failed to get history dates")
+        return []

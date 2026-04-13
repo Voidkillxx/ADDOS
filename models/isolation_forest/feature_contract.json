@@ -16,12 +16,11 @@
     "pkt_byte_rate_ratio"
   ],
   "n_features": 14,
-  "threshold": 0.6201164786634781,
+  "threshold": 0.6904577759707491,
   "score_sign": "negated",
   "score_formula": "if_score = -model.score_samples(X)",
   "anomaly_rule": "is_anomaly = (if_score >= threshold)",
-  "contamination": 0.05,
-  "trained_on": "NORMAL only (label=0)",
-  "label_convention": "0=Normal, 1=Attack",
-  "dataset": "SNT + Mininet augmentation (flow_duration up to 2230s)"
+  "contamination": 0.01,
+  "trained_on": "NORMAL only (label=1)",
+  "label_convention": "1=Normal, 0=Attack"
 }
