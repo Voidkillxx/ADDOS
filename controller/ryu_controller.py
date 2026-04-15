@@ -321,15 +321,15 @@ class FatTreeController(app_manager.RyuApp):
             if msg.buffer_id != ofp.OFP_NO_BUFFER:
                 mod = parser.OFPFlowMod(
                     datapath=dp, priority=1,
-                    idle_timeout=10, hard_timeout=0,
-                    buffer_id=msg.buffer_id,
-                    match=match, instructions=inst)
+                    idle_timeout=60, hard_timeout=0,  # raised 10→60s: baseline ping at 1pps
+                    buffer_id=msg.buffer_id,           # was expiring after 10s idle causing
+                    match=match, instructions=inst)    # packet_count reset and UI counter drop
                 dp.send_msg(mod)
                 return
             else:
                 mod = parser.OFPFlowMod(
                     datapath=dp, priority=1,
-                    idle_timeout=10, hard_timeout=0,
+                    idle_timeout=60, hard_timeout=0,  # raised 10→60s: same fix
                     match=match, instructions=inst)
                 dp.send_msg(mod)
 

