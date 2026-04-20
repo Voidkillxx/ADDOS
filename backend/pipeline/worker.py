@@ -42,8 +42,9 @@ def _process_item(src_ip: str, flow_stats: dict,
 
     is_syn_flagged   = syn_filter.is_flagged(src_ip)
     switch_delta_pps = float(flow_stats.get("switch_delta_pps", 0.0)) if flow_stats else 0.0
-    # Must match ryu_controller threshold (lowered to 20 for faster VM detection)
-    is_flood_switch  = switch_delta_pps >= 20.0
+    # BUG 2 FIX: lowered from >= 20.0 to >= 5.0 — Mininet VM can't reliably
+    # generate 20+ pps floods; 5.0 pps distinguishes floods from 1 pps baseline
+    is_flood_switch  = switch_delta_pps >= 5.0
 
     # ── Baseline sensitivity fix (B2 + C1) ────────────────────────────────────
     # EXTRACTION_TRIGGER_S (2.0s) and EXTRACTION_TRIGGER_PKTS (10) were imported
@@ -76,7 +77,9 @@ def _process_item(src_ip: str, flow_stats: dict,
     # Non-flood low-rate gate — report as normal traffic so UI counters
     # (Normal Traffic, Forwarded) increment during baseline-only periods.
     # No ML inference runs — IF/RF are skipped entirely, zero FP risk.
-    if not is_flood_switch and pps < 1.0 and not is_syn_flagged:
+    # BUG 2 FIX: lowered from pps < 1.0 to pps < 0.1 so early-stage attack
+    # flows with just a few packets are not discarded before reaching inference.
+    if not is_flood_switch and pps < 0.1 and not is_syn_flagged:
         if _result_callback:
             _result_callback(src_ip, 0.0, False, "Normal", 0.0,
                              flow_stats=flow_stats, switch_stats=switch_stats,

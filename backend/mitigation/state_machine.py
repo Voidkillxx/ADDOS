@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 from backend.database import writer
+from backend.config import SIMULATION_MODE
 
 log = logging.getLogger(__name__)
 
@@ -14,9 +15,14 @@ log = logging.getLogger(__name__)
 PHASE1_DURATION_LOW  = 3.0   # Lowered from 10s for faster demo detection
 PHASE1_DURATION_HIGH = 5.0   # Lowered from 15s for faster demo detection
 
-# Phase 2 — Time Ban: escalating bans, max 30 min (1800s)
-# Each re-offence doubles the ban: 2min → 5min → 10min → 30min
-BAN_LEVELS     = [120, 300, 600, 1800]   # seconds per escalation level
+# Phase 2 — Time Ban: escalating bans
+# BUG 2 FIX: use short durations in SIMULATION_MODE so testers see full
+# attack-detect-ban-release cycles without waiting 30 minutes.
+if SIMULATION_MODE:
+    BAN_LEVELS = [30, 60, 120, 300]   # seconds — short for simulation/demo
+    log.warning("SIMULATION_MODE is ON — using short ban durations for testing: %s", BAN_LEVELS)
+else:
+    BAN_LEVELS = [120, 300, 600, 1800]  # seconds — production (2min→5min→10min→30min)
 MAX_BAN_LEVEL  = len(BAN_LEVELS) - 1
 
 # Phase 3 — Blackhole: full drop, 1hr TTL then auto-release
