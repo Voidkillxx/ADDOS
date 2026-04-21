@@ -197,7 +197,14 @@ class StateMachine:
                     offence_count = 1,
                 )
                 self._states[src_ip] = state
-                # Apply rate limit immediately during quarantine observation
+                # Apply BOTH quarantine (priority 90) AND rate_limit (priority 80)
+                # simultaneously on Phase 1 entry.
+                # SLIP-THROUGH FIX: previously only rate_limit (priority 80) was sent.
+                # Priority 80 is the weakest drop rule — most attacker packets still
+                # slipped through. Quarantine (priority 90) is stronger and drops
+                # more aggressively. Sending both ensures maximum coverage across
+                # all switches from the moment of first detection.
+                self._push_command(src_ip, "quarantine")
                 self._push_command(src_ip, "rate_limit")
                 log.info("Phase 1 Quarantine+RateLimit: %s  (conf=%.1f%%  vector=%s  priority=%s  duration=%.0fs)",
                          src_ip, confidence * 100, attack_class, _prio, state.phase1_duration())
@@ -280,8 +287,9 @@ class StateMachine:
         recent_pps = getattr(state, "recent_pps", None)
 
         score_elevated = state.if_score >= thr
-        # pps threshold: > 5.0 means still actively flooding; < 5.0 likely stopped
-        pps_elevated   = (recent_pps is None) or (recent_pps > 5.0)
+        # pps threshold lowered 5.0→1.0 to match new flood gate in worker/ryu.
+        # Previously attackers at 2-4 pps were released instead of escalated.
+        pps_elevated   = (recent_pps is None) or (recent_pps > 1.0)
 
         if score_elevated and pps_elevated:
             # Both signals agree: attack persisted — escalate
@@ -290,7 +298,7 @@ class StateMachine:
             reason = (
                 f"score normalized (IF={state.if_score:.4f} < thr={thr:.4f})"
                 if not score_elevated
-                else f"traffic stopped (pps={recent_pps:.1f} <= 5.0)"
+                else f"traffic stopped (pps={recent_pps:.1f} <= 1.0)"
             )
             log.info("Phase1 complete: %s %s — releasing", src_ip, reason)
             self._clear(src_ip, reason="Attack Stopped")
