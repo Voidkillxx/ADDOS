@@ -44,7 +44,9 @@ def _process_item(src_ip: str, flow_stats: dict,
     switch_delta_pps = float(flow_stats.get("switch_delta_pps", 0.0)) if flow_stats else 0.0
     # BUG 2 FIX: lowered from >= 20.0 to >= 5.0 — Mininet VM can't reliably
     # generate 20+ pps floods; 5.0 pps distinguishes floods from 1 pps baseline
-    is_flood_switch  = switch_delta_pps >= 5.0
+    # Lowered from 5.0 → 1.0 — ICMP/UDP flows bypass controller after first packet
+    # so switch_delta_pps builds slowly. 1.0 catches them much earlier.
+    is_flood_switch  = switch_delta_pps >= 1.0
 
     # ── Baseline sensitivity fix (B2 + C1) ────────────────────────────────────
     # EXTRACTION_TRIGGER_S (2.0s) and EXTRACTION_TRIGGER_PKTS (10) were imported

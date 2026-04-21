@@ -19,16 +19,15 @@ CONTROLLER_PORT = 6633
 # ------------------------------------------------------------------
 # Traffic volume constants
 # ------------------------------------------------------------------
-# BASELINE_BURST_INTERVAL: initial burst phase — 5 pps for ~30s
-# Quickly fills OVS flow table past the pkt_count >= 50 guard.
-# 5 pps is at the ML flood gate boundary but safe since all 8 legit
-# hosts ping different targets (no single switch sees 5+ pps from one IP).
-BASELINE_BURST_INTERVAL = "0.2"   # ping -i 0.2 → 5 pps
+# BASELINE_BURST_INTERVAL: initial burst phase — 10 pps for ~15s
+# Quickly fills OVS flow table and makes traffic visible on dashboard immediately.
+BASELINE_BURST_INTERVAL = "0.1"   # ping -i 0.1 → 10 pps
 
-# BASELINE_CONT_INTERVAL: continuous slow ping after burst — ~3 pps
-# Clearly visible in the Live Traffic Monitor (was 1 pps = nearly flat).
-# Still well below the per-switch ML inference gate so no false positives.
-BASELINE_CONT_INTERVAL  = "0.3"   # ping -i 0.3 → ~3 pps
+# BASELINE_CONT_INTERVAL: continuous traffic after burst — ~5 pps per stream
+# 3 streams × 5 pps = ~15 pps/host total → clearly visible on dashboard.
+# Each stream targets a different IP so no single switch sees all 15 pps from one IP.
+# Still safely classified as Normal by Isolation Forest (spread across 3 targets).
+BASELINE_CONT_INTERVAL  = "0.2"   # ping -i 0.2 → 5 pps per stream
 
 # Attack volume for single (finite) attacks.
 ATTACK_PKT_COUNT = 5000   # 5k pkts at --flood takes ~2-3s in Mininet VM
@@ -155,35 +154,34 @@ def _get_baseline_target(host, hosts: list) -> str:
 def start_baseline_traffic(hosts: list) -> None:
     """Legit-only baseline traffic. Attacker hosts stay silent.
 
-    Phase 1 — burst: ping -c 150 -i BASELINE_BURST_INTERVAL (5 pps, ~30s)
-      Ensures OVS flow table has >100 packets so the ryu_controller
-      pkt_count >= 50 guard is satisfied for normal-mode submissions.
+    Phase 1 — burst: ping -c 100 -i BASELINE_BURST_INTERVAL (10 pps, ~10s)
+      Quickly fills OVS flow table and makes traffic immediately visible.
 
-    Phase 2 — continuous: 3 parallel ping streams at ~3 pps each (~9 pps/host)
-      Clearly visible in Live Traffic Monitor. Still safely below the
-      ML flood gate (5 pps per-IP) since each stream targets a different IP.
+    Phase 2 — continuous: 3 parallel ping streams at ~5 pps each (~15 pps/host)
+      Clearly visible in Live Traffic Monitor. Each stream targets a different IP
+      so no single switch sees all 15 pps from one src — stays Normal to ML model.
 
-    BUG FIX: while-loop so continuous ping auto-restarts if it dies silently.
+    BUG FIX: ping -c 300 (no sleep) so continuous ping has no gaps between batches.
     """
     attacker_nums = _ATTACKER_NUMS
     legit = [h for h in hosts if int(h.name[1:]) not in attacker_nums]
     info(f"*** Starting baseline traffic on {len(legit)} legitimate hosts\n")
-    info(f"    → burst:  ping -c 150 -i {BASELINE_BURST_INTERVAL} (5 pps, ~30s)\n")
-    info(f"    → then:   3x ping -i {BASELINE_CONT_INTERVAL} (~3 pps each → ~9 pps/host)\n")
+    info(f"    → burst:  ping -c 100 -i {BASELINE_BURST_INTERVAL} (10 pps, ~10s)\n")
+    info(f"    → then:   3x ping -i {BASELINE_CONT_INTERVAL} (~5 pps each → ~15 pps/host)\n")
 
     for host in legit:
         target = _get_baseline_target(host, hosts)
         # Kill any stale ping processes before starting fresh
         host.cmd("pkill -f 'ping -c 150' 2>/dev/null; pkill -f 'ping -c 30' 2>/dev/null; pkill -f 'ping -i' 2>/dev/null; true")
 
-        # Burst phase
+        # Burst phase — 100 pkts at 10 pps = ~10s, fills flow table fast
         host.cmd(
-            f"ping -c 150 -i {BASELINE_BURST_INTERVAL} {target} > /dev/null 2>&1 &"
+            f"ping -c 100 -i {BASELINE_BURST_INTERVAL} {target} > /dev/null 2>&1 &"
         )
 
-        # Stream 1: primary target (same as burst) — auto-restarts via while-loop
+        # Stream 1: primary target — large batch (300 pkts) so gaps are rare, auto-restarts
         host.cmd(
-            f"(while true; do ping -c 30 -i {BASELINE_CONT_INTERVAL} {target}; sleep 0.5; done) > /dev/null 2>&1 &"
+            f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target}; done) > /dev/null 2>&1 &"
         )
 
         # Stream 2: second legit target for more visible baseline traffic
@@ -192,14 +190,14 @@ def start_baseline_traffic(hosts: list) -> None:
         if other_hosts:
             target2 = other_hosts[0].IP()
             host.cmd(
-                f"(while true; do ping -c 30 -i {BASELINE_CONT_INTERVAL} {target2}; sleep 0.5; done) > /dev/null 2>&1 &"
+                f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target2}; done) > /dev/null 2>&1 &"
             )
 
         # Stream 3: third legit target — spreads traffic across subnets
         if len(other_hosts) > 1:
             target3 = other_hosts[1].IP()
             host.cmd(
-                f"(while true; do ping -c 30 -i {BASELINE_CONT_INTERVAL} {target3}; sleep 0.5; done) > /dev/null 2>&1 &"
+                f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target3}; done) > /dev/null 2>&1 &"
             )
 
 
@@ -396,6 +394,13 @@ def stop_all_attacks(net):
             info(f"    cleared: {ip}\n")
         _sock.close()
         info("    Controller state cleared.\n")
+        # BUG FIX: wait for controller cooldown intervals to tick down before
+        # baseline restarts. Without this, the first baseline pings arrive while
+        # switch_delta_pps is still elevated from the attack, causing them to be
+        # misclassified as flood traffic. 4s = 3 x STATS_INTERVAL(1.0s) + 1s buffer.
+        info("*** Waiting 4s for controller cooldown (prevents baseline false-positive)...\n")
+        time.sleep(4)
+        info("    Cooldown complete — safe to restart baseline traffic.\n")
     except Exception as e:
         info(f"    Warning: could not clear controller state via ZMQ: {e}\n")
         info("    (OVS rules are flushed; backend will self-clear after TTL expiry)\n")
@@ -603,7 +608,7 @@ def _warmup_macs(net, hosts, max_rounds: int = 2) -> None:
     local_total = sum(len(g) * (len(g) - 1) for g in subnet_groups.values())
     info(f"*** Phase 1 warmup — {local_total} local pairs (edge switches)...\n")
 
-    info(f"    Round 1/1 ...\n")
+    # Launch ALL pings simultaneously — don't wait between them
     procs = []
     for group in subnet_groups.values():
         for src in group:
@@ -613,28 +618,51 @@ def _warmup_macs(net, hosts, max_rounds: int = 2) -> None:
                 p = src.popen(
                     f"ping -c1 -W1 {dst.IP()} > /dev/null 2>&1", shell=True)
                 procs.append(p)
+    # Wait with a hard cap — never block more than 4s total for Phase 1
+    _deadline = time.time() + 4.0
     for p in procs:
-        p.wait()
+        _left = max(0.1, _deadline - time.time())
+        try:
+            p.wait(timeout=_left)
+        except Exception:
+            p.kill()
 
     info("*** Phase 1 done — edge switch tables populated.\n")
 
-    cross_pairs = [
+    # Phase 2: cross-subnet — only use a SAMPLE of pairs (not all 56+)
+    # Full cross-product causes 1-2min delay. A sample of 16 pairs is enough
+    # to populate agg/core switch MAC tables without blocking the CLI.
+    cross_all = [
         (src, dst)
         for src in legit_hosts
         for dst in legit_hosts
         if src is not dst
         and ".".join(src.IP().split(".")[:3]) != ".".join(dst.IP().split(".")[:3])
     ]
-    info(f"*** Phase 2 warmup — {len(cross_pairs)} cross-subnet pairs (agg + core switches)...\n")
-    info("    (1 round, ping -c1 -W1)\n")
+    # Pick one cross-subnet pair per legit host (covers all pods with minimal pings)
+    seen_srcs = set()
+    cross_sample = []
+    for src, dst in cross_all:
+        if src.name not in seen_srcs:
+            cross_sample.append((src, dst))
+            seen_srcs.add(src.name)
+
+    info(f"*** Phase 2 warmup — {len(cross_sample)} cross-subnet pairs (agg + core switches)...\n")
+    info("    (sampled, ping -c1 -W1, max 4s)\n")
 
     procs = []
-    for src, dst in cross_pairs:
+    for src, dst in cross_sample:
         p = src.popen(
             f"ping -c1 -W1 {dst.IP()} > /dev/null 2>&1", shell=True)
         procs.append(p)
+    # Hard cap of 4s for Phase 2 too
+    _deadline = time.time() + 4.0
     for p in procs:
-        p.wait()
+        _left = max(0.1, _deadline - time.time())
+        try:
+            p.wait(timeout=_left)
+        except Exception:
+            p.kill()
 
     info("*** Phase 2 done — agg/core switch tables populated.\n")
     info("*** All paths learned — hosts should be fully reachable.\n")
@@ -715,17 +743,17 @@ def restore_baseline_for_ip(hosts: list, src_ip: str) -> bool:
             # Restart all 3 streams just like start_baseline_traffic does
             target = others[0].IP()
             host.cmd(
-                f"(while true; do ping -c 30 -i {BASELINE_CONT_INTERVAL} {target}; sleep 0.5; done) > /dev/null 2>&1 &"
+                f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target}; done) > /dev/null 2>&1 &"
             )
             if len(others) > 1:
                 target2 = others[1].IP()
                 host.cmd(
-                    f"(while true; do ping -c 30 -i {BASELINE_CONT_INTERVAL} {target2}; sleep 0.5; done) > /dev/null 2>&1 &"
+                    f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target2}; done) > /dev/null 2>&1 &"
                 )
             if len(others) > 2:
                 target3 = others[2].IP()
                 host.cmd(
-                    f"(while true; do ping -c 30 -i {BASELINE_CONT_INTERVAL} {target3}; sleep 0.5; done) > /dev/null 2>&1 &"
+                    f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target3}; done) > /dev/null 2>&1 &"
                 )
             _restore_log.info("Restored baseline for %s (3x ping -i %s)", src_ip, BASELINE_CONT_INTERVAL)
             return True
