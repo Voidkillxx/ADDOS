@@ -100,7 +100,13 @@ def _build_pdf(start_str: str, end_str: str, rows: list[dict]) -> bytes:
     # never referenced anywhere in this function.
 
     story.append(Paragraph(
-        f"DDoS Mitigation Report — {start_str} to {end_str}", title_style
+        f"A-DDoS — DDoS Mitigation Report", title_style
+    ))
+    story.append(Paragraph(
+        f"Report Period: {start_str}  →  {end_str}",
+        ParagraphStyle("subtitle", parent=styles["Normal"],
+                       fontSize=10, textColor=colors.HexColor("#6b7280"),
+                       spaceAfter=6),
     ))
     story.append(HRFlowable(width="100%", thickness=1,
                             color=colors.HexColor("#cccccc")))
@@ -108,25 +114,33 @@ def _build_pdf(start_str: str, end_str: str, rows: list[dict]) -> bytes:
 
     story.append(Paragraph("1. Executive Summary", h1_style))
 
-    total_threats = len(rows)
+    # Deduplicate rows so summary counts match the chronological log exactly.
+    # Raw rows contain repeated detections per IP/phase — keep first (src_ip, action_taken).
+    seen_for_summary: set = set()
+    deduped_rows = []
+    for r in rows:
+        key = (r["src_ip"], r["action_taken"])
+        if key not in seen_for_summary:
+            seen_for_summary.add(key)
+            deduped_rows.append(r)
+
+    total_threats = len(deduped_rows)
 
     vectors: dict[str, int] = {}
-    for r in rows:
+    for r in deduped_rows:
         v = r["attack_vector"] or "Uncertain"
         vectors[v] = vectors.get(v, 0) + 1
 
     actions: dict[str, int] = {}
-    for r in rows:
+    for r in deduped_rows:
         a = r["action_taken"] or "—"
         actions[a] = actions.get(a, 0) + 1
 
-    # writer.log_manual_action stores action as action.replace("_"," ").title()
-    # → "manual_release" → "Manual Release", "manual_block" → "Manual Block"
     manual_release = sum(
-        1 for r in rows if r["is_manual"] and "Release" in str(r["action_taken"])
+        1 for r in deduped_rows if r["is_manual"] and "Release" in str(r["action_taken"])
     )
     manual_block = sum(
-        1 for r in rows if r["is_manual"] and "Block" in str(r["action_taken"])
+        1 for r in deduped_rows if r["is_manual"] and "Block" in str(r["action_taken"])
     )
 
     summary_rows = query("""
@@ -185,10 +199,11 @@ def _build_pdf(start_str: str, end_str: str, rows: list[dict]) -> bytes:
 
     story.append(Paragraph("2. Chronological Mitigation Log", h1_style))
 
+    # deduped_rows already computed above for summary — reuse directly.
     log_headers = ["Timestamp", "Source IP", "Class",
                    "Vector", "Confidence", "Priority", "Action"]
     log_data    = [log_headers]
-    for r in rows:
+    for r in deduped_rows:
         conf_pct = f"{r['confidence']*100:.1f}%" if r["confidence"] else "—"
         log_data.append([
             r["timestamp"],

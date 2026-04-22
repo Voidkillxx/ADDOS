@@ -333,6 +333,22 @@ class StateMachine:
                  state.src_ip, state.ban_level, ban_secs, exp_str)
         self._persist(state, block_expires_at=exp_str)
 
+        # Audit log — phase transition entry (always written, never deduped)
+        ban_mins = ban_secs // 60
+        ban_label = f"{ban_mins}m" if ban_mins >= 1 else f"{ban_secs}s"
+        writer.log_mitigation_event({
+            "timestamp":       datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "src_ip":          state.src_ip,
+            "predicted_class": "DDoS",
+            "attack_vector":   state.attack_vector,
+            "confidence":      state.confidence,
+            "priority":        state.priority,
+            "action_taken":    f"Time Ban ({ban_label})",
+            "if_score":        state.if_score,
+            "phase":           "Phase 2 — Time Ban",
+            "is_manual":       False,
+        })
+
     def _advance_to_blackhole(self, state: IpState) -> None:
         """Escalate to Phase 3 Blackhole — max severity, 1hr TTL."""
         # Clear SSE dedup so the blackhole event always reaches the audit log.
@@ -355,6 +371,20 @@ class StateMachine:
         log.info("Phase 3 Blackhole: %s  TTL=%ds  expires=%s",
                  state.src_ip, BLACKHOLE_TTL_SECONDS, exp_str)
         self._persist(state, block_expires_at=exp_str)
+
+        # Audit log — blackhole transition entry
+        writer.log_mitigation_event({
+            "timestamp":       datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "src_ip":          state.src_ip,
+            "predicted_class": "DDoS",
+            "attack_vector":   state.attack_vector,
+            "confidence":      state.confidence,
+            "priority":        state.priority,
+            "action_taken":    "Blackhole",
+            "if_score":        state.if_score,
+            "phase":           "Phase 3 — Blackhole",
+            "is_manual":       False,
+        })
 
     def _clear(self, src_ip: str, reason: str = "Released") -> None:
         state = self._states.pop(src_ip, None)
@@ -404,7 +434,7 @@ class StateMachine:
                 )
                 self._states[src_ip] = state
                 self._advance_to_blackhole(state)
-                log.info("Re-offence → Blackhole: %s  offences=%d", src_ip, state.offence_count)
+                log.info("Re-offence → Blackhole: %s  offences=%d", src_ip, state.offence_count)            
             else:
                 # Escalate to next ban level via phase 1 observation first
                 state = IpState(
@@ -423,6 +453,19 @@ class StateMachine:
                 log.info("Re-offence → Phase1 (ban_level=%d next): %s  offences=%d",
                          new_ban_lvl, src_ip, state.offence_count)
                 self._persist(state)
+                # Audit log — re-offence re-entry into Phase 1
+                writer.log_mitigation_event({
+                    "timestamp":       datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "src_ip":          src_ip,
+                    "predicted_class": "DDoS",
+                    "attack_vector":   attack_class,
+                    "confidence":      confidence,
+                    "priority":        _prio,
+                    "action_taken":    "Quarantined",
+                    "if_score":        if_score,
+                    "phase":           f"Phase 1 — Re-offence #{state.offence_count}",
+                    "is_manual":       False,
+                })
 
     # ------------------------------------------------------------------
     # Manual operator actions
@@ -435,7 +478,15 @@ class StateMachine:
             state = self._states.pop(src_ip)
         self._push_command(src_ip, "clear")
         writer.delete_quarantine_state(src_ip)
-        writer.log_manual_action(src_ip, "manual_release")
+        writer.log_manual_action(
+            src_ip,
+            "manual_release",
+            attack_vector = state.attack_vector,
+            confidence    = state.confidence,
+            priority      = state.priority,
+            if_score      = state.if_score,
+            phase         = state.phase_label(),
+        )
         writer.log_attack_history(
             src_ip         = src_ip,
             attack_vector  = state.attack_vector,
@@ -486,7 +537,15 @@ class StateMachine:
                 state.ttl_expires_at = None
             self._persist(state, block_expires_at=None)
         self._push_command(src_ip, "block", ttl=None)
-        writer.log_manual_action(src_ip, "manual_block")
+        writer.log_manual_action(
+            src_ip,
+            "manual_block",
+            attack_vector = state.attack_vector,
+            confidence    = state.confidence,
+            priority      = state.priority,
+            if_score      = state.if_score,
+            phase         = state.phase_label(),
+        )
         log.info("Manual blackhole (permanent): %s", src_ip)
         return True
 

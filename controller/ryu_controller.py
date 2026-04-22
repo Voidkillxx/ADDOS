@@ -415,13 +415,16 @@ class FatTreeController(app_manager.RyuApp):
                 if stat.packet_count < 1 or pps < 0.05:  # lowered from 0.5 — catches ICMP/UDP early
                     continue
 
+            # Protocol resolution priority:
+            # 1. Flow match ip_proto (most accurate — set by packet_in)
+            # 2. Per-src-IP cached proto from _src_proto (second best)
+            # 3. Skip — do NOT fall back to switch-dominant proto.
+            #    In mixed campaigns the switch-dominant proto (e.g. ICMP)
+            #    would overwrite all other flows, causing every attack to
+            #    be classified as ICMP regardless of actual protocol.
             _flow_ip_proto = int(match.get("ip_proto", 0))
             if not _flow_ip_proto:
                 _flow_ip_proto = int(self._src_proto[dpid].get(src_ip, 0))
-            if not _flow_ip_proto:
-                proto_counts = self._switch_proto.get(dpid, {})
-                if proto_counts:
-                    _flow_ip_proto = max(proto_counts, key=proto_counts.get)
 
             self._push({
                 "type":       "flow_stats",

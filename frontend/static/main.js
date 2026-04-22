@@ -8,7 +8,8 @@ const MAX_LOG = window.MAX_LOG || 100;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let range  = 'Live';
-let prev   = { t: 0, m: 0, n: 0 };
+let prev   = { t: 0, m: 0, n: 0 };   // chart delta tracking (live line)
+let card   = { t: -1, m: -1, n: -1 }; // card percentage tracking (separate!)
 let ifThr  = 0;
 let logCt  = 0;
 // Bug 3 fix: track log rows by src_ip — update in-place instead of duplicating
@@ -70,19 +71,26 @@ async function fetchStats() {
     const cm  = s.malicious_dropped || 0;
     const cn  = s.normal_packets    || 0;
     const tot = Math.max(ct, 1);
-    const pctDelta = (c, p) => {
+
+    // Card sub-labels: % of total for mal/norm; rate-of-change for total
+    // Use separate `card` tracker so it never conflicts with chart `prev`
+    const pctChange = (c, p) => {
+      if (p < 0) return '—';   // first poll — no meaningful delta yet
       const d = ((c - p) / Math.max(p, 1)) * 100;
       return (d >= 0 ? '+' : '') + d.toFixed(1) + '%';
     };
 
     set('c-total',   ct.toLocaleString());
-    set('c-total-s', pctDelta(ct, prev.t));
+    set('c-total-s', pctChange(ct, card.t));
     set('c-mal',     cm.toLocaleString());
     set('c-mal-s',   `-${((cm / tot) * 100).toFixed(1)}%`);
     set('c-norm',    cn.toLocaleString());
     set('c-norm-s',  `+${((cn / tot) * 100).toFixed(1)}%`);
     set('c-thr',     (s.active_threats || 0).toString());
     set('p-rt',      `${s.avg_latency_ms || 0} ms`);
+
+    // Update card tracker
+    card = { t: ct, m: cm, n: cn };
 
     const fpRate = typeof s.fp_rate === 'number' ? s.fp_rate : 0;
     const fpEl   = document.getElementById('p-fp');
@@ -222,20 +230,82 @@ function pushChartPoint(label, di, db, df) {
 }
 
 // ── SSE live events ───────────────────────────────────────────────────────────
-function connectSSE() {
-  const es  = new EventSource(`${API}/api/events`);
-  es.onmessage = e => { try { addLogRow(JSON.parse(e.data)); } catch (_) {} };
-  es.onerror   = () => { es.close(); setTimeout(connectSSE, 3000); };
+// Track the timestamp of the last event we received so reconnects only fetch
+// events we actually missed — no duplicates, no wasted data.
+let _lastEventTs = '';
+
+async function fetchRecentEvents() {
+  try {
+    const url = _lastEventTs
+      ? `${API}/api/recent_events?limit=100&since=${encodeURIComponent(_lastEventTs)}`
+      : `${API}/api/recent_events?limit=100`;
+    const r = await fetch(url);
+    if (!r.ok) return;
+    const events = await r.json();
+    // Events come back oldest-first — insert in order so newest ends up on top
+    // Use addReplayRow (not addLogRow) so every DB row gets its own table row
+    // regardless of IP — the audit log is a full chronological record.
+    events.forEach(ev => addReplayRow(ev));
+  } catch (_) {}
 }
 
-function addLogRow(ev) {
+// addReplayRow — inserts a historical row from /api/recent_events.
+// Unlike addLogRow (which deduplicates by IP for live updates),
+// this always inserts a new row so the full audit history is visible.
+function addReplayRow(ev) {
+  const tb = document.getElementById('log-body');
+  const placeholder = tb.querySelector('[colspan]');
+  if (placeholder) placeholder.parentElement.remove();
+
+  const ip        = (ev.src_ip    || '—').trim();
+  const timestamp = (ev.timestamp || '—').trim();   // strip stray \n from DB
+
+  const html = `
+    <td class="mono">${timestamp}</td>
+    <td class="ip">${ip}</td>
+    <td>${renderClass(ev.predicted_class || '—')}</td>
+    <td>${renderVector(ev.attack_vector  || '—')}</td>
+    <td class="mono">${ev.confidence     || '—'}</td>
+    <td>${renderPriority(ev.priority     || 'Low')}</td>
+    <td>${renderAction(ev.action_taken   || '—')}</td>`;
+
+  if (logCt < MAX_LOG) logCt++;
+  set('log-ct', logCt.toString());
+
+  const tr = document.createElement('tr');
+  tr.innerHTML = html;
+  // Insert at top so newest (last in array) ends up at the top
+  tb.insertBefore(tr, tb.firstChild);
+
+  // Also register in _logRows so live SSE updates can find & flash this IP
+  _logRows.set(ip, tr);
+}
+
+function connectSSE() {
+  const es = new EventSource(`${API}/api/events`);
+  es.onmessage = e => {
+    try {
+      const ev = JSON.parse(e.data);
+      if (ev.timestamp) _lastEventTs = ev.timestamp;
+      addLogRow(ev);
+    } catch (_) {}
+  };
+  es.onerror = () => {
+    es.close();
+    // On reconnect: fetch any events that arrived while we were disconnected
+    setTimeout(() => { fetchRecentEvents(); connectSSE(); }, 3000);
+  };
+}
+
+function addLogRow(ev, isReplay = false) {
   const tb          = document.getElementById('log-body');
   const placeholder = tb.querySelector('[colspan]');
   if (placeholder) placeholder.parentElement.remove();
 
-  const ip   = ev.src_ip || '—';
+  const ip   = (ev.src_ip    || '—').trim();
+  const ts   = (ev.timestamp || '—').trim();   // strip stray \n from DB
   const html = `
-    <td class="mono">${ev.timestamp      || '—'}</td>
+    <td class="mono">${ts}</td>
     <td class="ip">${ip}</td>
     <td>${renderClass(ev.predicted_class || '—')}</td>
     <td>${renderVector(ev.attack_vector  || '—')}</td>
@@ -244,13 +314,15 @@ function addLogRow(ev) {
     <td>${renderAction(ev.action_taken   || '—')}</td>`;
 
   if (_logRows.has(ip)) {
-    // IP already in log — update columns in-place, no new row
+    // IP already in log — update in-place
     const tr = _logRows.get(ip);
     tr.innerHTML = html;
-    // Flash highlight to show update
-    tr.style.transition = 'background 0.3s';
-    tr.style.background = 'rgba(61,108,255,0.15)';
-    setTimeout(() => { tr.style.background = ''; }, 600);
+    if (!isReplay) {
+      // Only flash on live updates, not on replay fills
+      tr.style.transition = 'background 0.3s';
+      tr.style.background = 'rgba(61,108,255,0.15)';
+      setTimeout(() => { tr.style.background = ''; }, 600);
+    }
     return;
   }
 
@@ -268,10 +340,13 @@ function addLogRow(ev) {
   set('log-ct', logCt.toString());
 
   const tr     = document.createElement('tr');
-  tr.className = 'row-in';
+  tr.className = isReplay ? '' : 'row-in';  // no slide-in animation for replay
   tr.innerHTML = html;
   _logRows.set(ip, tr);
   tb.insertBefore(tr, tb.firstChild);
+
+  // Fire browser notification for live events only (not replay fills)
+  if (!isReplay) _fireNotif(ev);
 }
 
 // ── Quarantine actions ────────────────────────────────────────────────────────
@@ -290,13 +365,25 @@ async function quarantineAction(action, ip) {
 }
 
 // ── Report modal ──────────────────────────────────────────────────────────────
-function openModal() {
+async function openModal() {
   const today = new Date().toISOString().split('T')[0];
   const week  = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
-  document.getElementById('r-start').value    = week;
-  document.getElementById('r-end').value      = today;
+
+  // Pre-fill text inputs
+  document.getElementById('r-start').value     = week;
+  document.getElementById('r-end').value       = today;
   document.getElementById('m-err').textContent = '';
   document.getElementById('modal').classList.add('open');
+
+  // Load history dates then init calendars with pre-selected values
+  await _loadHistoryDates();
+
+  const todayDt = new Date();
+  const weekDt  = new Date(Date.now() - 7 * 86400000);
+  _calState.start = { year: weekDt.getFullYear(), month: weekDt.getMonth(), selected: week };
+  _calState.end   = { year: todayDt.getFullYear(), month: todayDt.getMonth(), selected: today };
+  _renderCal('start');
+  _renderCal('end');
 }
 
 function closeModal() {
@@ -410,10 +497,50 @@ function toggleTheme() {
   if (localStorage.getItem('adddos-theme') === 'light') toggleTheme();
 })();
 
+// ── Browser Notifications ────────────────────────────────────────────────────
+// Request permission once on load. Fires a notification whenever a new
+// anomaly event arrives via SSE (live) or is loaded via fetchRecentEvents.
+// Throttled to 1 notification per unique IP per 30 seconds to avoid spam.
+const _notifCooldown = new Map(); // src_ip → last notified monotonic ms
+const _NOTIF_TTL_MS  = 30_000;
+
+function _requestNotifPermission() {
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
+function _fireNotif(ev) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const ip  = (ev.src_ip || '').trim();
+  const now = performance.now();
+  if (_notifCooldown.has(ip) && now - _notifCooldown.get(ip) < _NOTIF_TTL_MS) return;
+  _notifCooldown.set(ip, now);
+
+  const vec    = ev.attack_vector  || 'Unknown';
+  const action = ev.action_taken   || '—';
+  const conf   = ev.confidence     || '—';
+  const pri    = ev.priority       || 'Low';
+  const icon   = pri === 'High' ? '🔴' : '🟡';
+
+  try {
+    const n = new Notification(`${icon} A-DDoS: ${vec} Detected`, {
+      body: `IP: ${ip}  |  Action: ${action}  |  Confidence: ${conf}`,
+      icon: '/static/favicon.ico',
+      tag:  `addos-${ip}`,   // replaces previous notif for same IP
+      requireInteraction: pri === 'High',
+    });
+    // Auto-close low-priority after 6s
+    if (pri !== 'High') setTimeout(() => n.close(), 6000);
+  } catch (_) {}
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
+_requestNotifPermission();
 fetchStats();
-fetchModelInfo();   // M11 fix: called once here, NOT added to setInterval
+fetchModelInfo();      // M11 fix: called once, NOT polled
 fetchQuarantine();
+fetchRecentEvents();   // Pre-fill audit log from DB on page load / reconnect
 connectSSE();
 setInterval(fetchStats,      POLL_MS);
 setInterval(fetchQuarantine, POLL_MS);
@@ -514,9 +641,16 @@ document.addEventListener('click', () => {
   document.getElementById('cal-end-popup')?.classList.remove('open');
 });
 
-// Allow typing date directly into text input
+// Allow typing date directly into text input — digits and dashes only
 function onDateType(which, val) {
-  // Accepts YYYY-MM-DD format — validate and update calendar state
+  // Strip anything that isn't a digit or dash
+  const cleaned = val.replace(/[^\d-]/g, '');
+  const el = document.getElementById(`r-${which}`);
+  if (el && cleaned !== val) {
+    el.value = cleaned;
+    val = cleaned;
+  }
+  // Only sync calendar once we have a full YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}$/.test(val)) {
     const dt = new Date(val + 'T00:00:00');
     if (!isNaN(dt)) {
@@ -528,6 +662,7 @@ function onDateType(which, val) {
   }
 }
 
+// _initCals is kept for reference but openModal handles init directly
 function _initCals() {
   const today    = new Date();
   const lastWeek = new Date(today);
@@ -538,14 +673,4 @@ function _initCals() {
   _renderCal('end');
 }
 
-// Override openModal
-async function openModal() {
-  document.getElementById('m-err').textContent = '';
-  document.getElementById('r-start').value = '';
-  document.getElementById('r-end').value   = '';
-  _calState.start.selected = '';
-  _calState.end.selected   = '';
-  document.getElementById('modal').classList.add('open');
-  await _loadHistoryDates();
-  _initCals();
-}
+// Override openModal — this stub intentionally left blank; real openModal is defined above

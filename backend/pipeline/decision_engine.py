@@ -263,7 +263,11 @@ def on_result(src_ip: str, if_score, is_anomaly,
     if not is_anomaly:
         with _lock:
             _stats["normal_packets"] += 1
-        writer.log_traffic_summary(total=1, threats=0, true_neg=1, fp=0)
+        # Use actual packet_count from flow_stats so the chart reflects real
+        # traffic volume, not just 1 per flow evaluation per interval.
+        _pkt_count = int((flow_stats or {}).get("packet_count", 1))
+        _pkt_count = max(_pkt_count, 1)
+        writer.log_traffic_summary(total=_pkt_count, threats=0, true_neg=_pkt_count, fp=0)
         return
 
     loader.require_loaded()

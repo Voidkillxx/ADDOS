@@ -202,44 +202,171 @@ td.ip   { font-family: var(--mono); color: var(--text); font-weight: 600; font-s
 .cal-legend { display: flex; align-items: center; gap: 7px; margin-top: 12px; font-size: 11px; color: var(--sub); font-family: var(--mono); }
 .cal-legend-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
 
-/* Light mode calendar fix — was showing white text on white */
-body.light .cal-popup { background: var(--card); border-color: var(--border2); }
-body.light .cal-day { color: var(--text); }
-body.light .cal-month-label { color: var(--text); }
-body.light .cal-weekdays span { color: var(--sub); }
-body.light .date-text-input { background: var(--surface); color: var(--text); border-color: var(--border2); }
-body.light .cal-toggle-btn { background: var(--surface); color: var(--sub2); border-color: var(--border2); }
-body.light .cal-nav { color: var(--sub2); }
-body.light .cal-nav:hover { background: var(--border); color: var(--text); }
+/* Light mode calendar overrides consolidated in the main body.light block below */
 
 /* ── TOAST ───────────────────────────────────────────────────── */
 #toaster { position: fixed; bottom: 24px; right: 24px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
 .toast { background: var(--card); border: 1px solid var(--border2); border-radius: 10px; padding: 13px 18px; font-size: 12px; color: var(--sub2); box-shadow: 0 8px 28px rgba(0,0,0,.5); animation: tin .28s ease; max-width: 320px; }
 @keyframes tin { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
 
-/* ── LIGHT MODE ──────────────────────────────────────────────── */
-body.light {
-  --bg:      #f0f2f8;
-  --surface: #e8eaf2;
-  --card:    #ffffff;
-  --border:  #d8dce8;
-  --border2: #c8ccd8;
-  --text:    #111827;
-  --sub:     #6b7280;
-  --sub2:    #4b5563;
-  --blue-g:  rgba(61,108,255,.08);
-  --red-g:   rgba(255,61,90,.08);
-  --green-g: rgba(0,214,143,.08);
-  --amber-g: rgba(255,176,46,.08);
-}
-body.light::before { background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px); opacity: .5; }
-body.light .panel, body.light .metric-card, body.light .perf-card { box-shadow: 0 1px 4px rgba(0,0,0,.06); }
-body.light thead th { background: var(--card); }
-body.light .modal { box-shadow: 0 8px 32px rgba(0,0,0,.12); }
-body.light .badge  { background: rgba(61,108,255,.1); }
-
+/* ── THEME BUTTON ────────────────────────────────────────────── */
 .theme-btn { padding: 9px 18px; border-radius: 9px; cursor: pointer; font-family: var(--sans); font-size: 13px; font-weight: 500; border: 1px solid var(--border2); background: var(--card); color: var(--sub2); transition: all .18s; }
 .theme-btn:hover { border-color: var(--blue); color: var(--text); background: var(--blue-g); }
+
+/* ── LIGHT MODE ──────────────────────────────────────────────── */
+body.light {
+  --bg:      #f0f4f8;
+  --surface: #e8edf5;
+  --card:    #ffffff;
+  --border:  #dce2ee;
+  --border2: #c8d0e2;
+  --text:    #1e2535;
+  --sub:     #6b7a96;
+  --sub2:    #4e5e7a;
+  --blue:    #3461d1;
+  --blue-g:  rgba(52,97,209,.08);
+  --red:     #d93248;
+  --red-g:   rgba(217,50,72,.08);
+  --green:   #0aa870;
+  --green-g: rgba(10,168,112,.08);
+  --amber:   #c8820a;
+  --amber-g: rgba(200,130,10,.08);
+}
+
+/* Background grid — lighter, more elegant */
+body.light::before {
+  background-image:
+    linear-gradient(#d4dae8 1px, transparent 1px),
+    linear-gradient(90deg, #d4dae8 1px, transparent 1px);
+  opacity: .22;
+}
+
+/* Card elevation */
+body.light .panel,
+body.light .metric-card,
+body.light .perf-card {
+  box-shadow: 0 1px 3px rgba(15,17,23,.06), 0 4px 16px rgba(15,17,23,.04);
+}
+body.light .panel:hover,
+body.light .metric-card:hover,
+body.light .perf-card:hover {
+  box-shadow: 0 2px 8px rgba(15,17,23,.09), 0 8px 24px rgba(15,17,23,.06);
+}
+
+/* Header */
+body.light header { border-bottom-color: var(--border); }
+
+/* Status pill */
+body.light .status-pill {
+  background: rgba(0,184,122,.08);
+  border-color: rgba(0,184,122,.28);
+  color: var(--green);
+}
+body.light .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+/* Buttons */
+body.light .btn {
+  background: #ffffff;
+  border-color: var(--border2);
+  color: var(--sub2);
+  box-shadow: 0 1px 3px rgba(15,17,23,.06);
+}
+body.light .btn:hover { border-color: var(--blue); color: var(--blue); background: var(--blue-g); }
+body.light .btn-primary { background: var(--blue); }
+body.light .btn-primary:hover { background: #1e44d4; opacity: 1; }
+
+/* Range tabs */
+body.light .rt { border-color: var(--border2); color: var(--sub2); background: #ffffff; }
+body.light .rt:hover:not(.active) { border-color: var(--blue); color: var(--blue); background: var(--blue-g); }
+body.light .rt.active { background: var(--blue); border-color: var(--blue); color: #fff; }
+
+/* Badge */
+body.light .badge { background: rgba(41,85,232,.1); color: var(--blue); border-color: rgba(41,85,232,.25); }
+
+/* Panel sub text */
+body.light .panel-sub { color: var(--sub); }
+
+/* Table */
+body.light thead th { background: #f8f9fd; color: var(--sub); border-bottom-color: var(--border); }
+body.light tbody tr { border-bottom-color: var(--border); }
+body.light tbody tr:hover { background: rgba(41,85,232,.03); }
+body.light td { color: var(--sub2); }
+body.light td.mono { color: var(--text); }
+body.light td.ip   { color: var(--text); }
+body.light .tbl-scroll::-webkit-scrollbar-thumb { background: var(--border2); }
+
+/* Tags — richer contrast for light bg */
+body.light .t-ddos    { color: #c0152e; border-color: rgba(192,21,46,.35);  background: rgba(192,21,46,.07); }
+body.light .t-anomaly { color: #b45309; border-color: rgba(180,83,9,.35);   background: rgba(180,83,9,.07); }
+body.light .t-syn     { color: #b45309; border-color: rgba(180,83,9,.3);    background: rgba(180,83,9,.06); }
+body.light .t-udp     { color: #1d60b5; border-color: rgba(29,96,181,.35);  background: rgba(29,96,181,.07); }
+body.light .t-icmp    { color: #a21a6e; border-color: rgba(162,26,110,.35); background: rgba(162,26,110,.07); }
+body.light .t-unc     { color: var(--sub); border-color: var(--border2); background: transparent; }
+body.light .t-q       { color: #b45309; border-color: rgba(180,83,9,.35);   background: rgba(180,83,9,.07); }
+body.light .t-rl      { color: #c2470a; border-color: rgba(194,71,10,.35);  background: rgba(194,71,10,.07); }
+body.light .t-blocked { color: #c0152e; border-color: rgba(192,21,46,.35);  background: rgba(192,21,46,.07); }
+body.light .t-ban     { color: #92640a; border-color: rgba(146,100,10,.35); background: rgba(146,100,10,.07); }
+
+/* Score classes */
+body.light .sc-red { color: #c0152e; }
+body.light .sc-amb { color: #b45309; }
+body.light .sc-grn { color: #0a7a52; }
+body.light .p-high { color: #c0152e; }
+body.light .p-low  { color: var(--sub); }
+
+/* Quarantine panel */
+body.light .q-empty { color: var(--sub); }
+body.light .q-rel { color: #0a7a52; border-color: rgba(10,122,82,.35); }
+body.light .q-rel:hover { background: rgba(10,122,82,.08); }
+body.light .q-blk { color: #c0152e; border-color: rgba(192,21,46,.35); }
+body.light .q-blk:hover { background: rgba(192,21,46,.08); }
+
+/* Modal */
+body.light .overlay { background: rgba(100,110,140,.45); }
+body.light .modal { box-shadow: 0 16px 48px rgba(15,17,23,.14); background: #ffffff; }
+body.light .modal h2 { color: var(--text); }
+body.light .modal label { color: var(--sub); }
+body.light .modal-err { color: var(--red); }
+body.light .modal input[type=date] { background: var(--surface); border-color: var(--border2); color: var(--text); }
+body.light .modal input[type=date]:focus { border-color: var(--blue); }
+
+/* Calendar */
+body.light .cal-popup { background: #ffffff; border-color: var(--border); box-shadow: 0 12px 40px rgba(15,17,23,.14); }
+body.light .cal-month-label { color: var(--text); }
+body.light .cal-weekdays span { color: var(--sub); }
+body.light .cal-day { color: var(--text); }
+body.light .cal-day:hover:not(.cal-disabled):not(.cal-empty) { background: var(--blue); color: #fff; }
+body.light .cal-day.cal-selected { background: var(--blue); color: #fff; }
+body.light .cal-day.cal-today { border-color: var(--blue); }
+body.light .cal-day.cal-disabled { color: #c0c6d8; opacity: .6; }
+body.light .cal-nav { color: var(--sub); }
+body.light .cal-nav:hover { background: var(--surface); color: var(--text); }
+body.light .cal-legend { color: var(--sub); }
+body.light .date-text-input { background: var(--surface); color: var(--text); border-color: var(--border2); }
+body.light .date-text-input::placeholder { color: var(--sub); }
+body.light .date-text-input:focus { border-color: var(--blue); }
+body.light .cal-toggle-btn { background: var(--surface); color: var(--sub2); border-color: var(--border2); }
+body.light .cal-toggle-btn:hover { color: var(--blue); border-color: var(--blue); }
+
+/* Toast */
+body.light .toast { background: #ffffff; border-color: var(--border); color: var(--text); box-shadow: 0 8px 28px rgba(15,17,23,.12); }
+
+/* Perf cards */
+body.light .p-label  { color: var(--sub); }
+body.light .p-value  { color: var(--text); }
+body.light .p-detail { color: var(--sub2); }
+
+/* Metric cards */
+body.light .m-label { color: var(--sub); }
+body.light .m-value { color: var(--text); }
+
+/* Logo */
+body.light .logo-name { color: var(--text); }
+body.light .logo-sub  { color: var(--sub); }
+
+/* Theme btn */
+body.light .theme-btn { background: #ffffff; border-color: var(--border2); color: var(--sub2); }
+body.light .theme-btn:hover { border-color: var(--blue); color: var(--blue); }
 
 /* ── RESPONSIVE ──────────────────────────────────────────────── */
 @media (max-width:1100px) { .cards-grid, .perf-grid { grid-template-columns: repeat(2,1fr); } }

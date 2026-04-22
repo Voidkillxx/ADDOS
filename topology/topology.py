@@ -19,15 +19,15 @@ CONTROLLER_PORT = 6633
 # ------------------------------------------------------------------
 # Traffic volume constants
 # ------------------------------------------------------------------
-# BASELINE_BURST_INTERVAL: initial burst phase — 10 pps for ~15s
+# BASELINE_BURST_INTERVAL: initial burst phase — 20 pps for ~5s
 # Quickly fills OVS flow table and makes traffic visible on dashboard immediately.
-BASELINE_BURST_INTERVAL = "0.1"   # ping -i 0.1 → 10 pps
+BASELINE_BURST_INTERVAL = "0.05"  # ping -i 0.05 → 20 pps
 
-# BASELINE_CONT_INTERVAL: continuous traffic after burst — ~5 pps per stream
-# 3 streams × 5 pps = ~15 pps/host total → clearly visible on dashboard.
-# Each stream targets a different IP so no single switch sees all 15 pps from one IP.
+# BASELINE_CONT_INTERVAL: continuous traffic after burst — ~10 pps per stream
+# 3 streams x 10 pps = ~30 pps/host total -> clearly visible on dashboard.
+# Each stream targets a different IP so no single switch sees all 30 pps from one IP.
 # Still safely classified as Normal by Isolation Forest (spread across 3 targets).
-BASELINE_CONT_INTERVAL  = "0.2"   # ping -i 0.2 → 5 pps per stream
+BASELINE_CONT_INTERVAL  = "0.1"   # ping -i 0.1 -> 10 pps per stream
 
 # Attack volume for single (finite) attacks.
 ATTACK_PKT_COUNT = 5000   # 5k pkts at --flood takes ~2-3s in Mininet VM
@@ -172,11 +172,11 @@ def start_baseline_traffic(hosts: list) -> None:
     for host in legit:
         target = _get_baseline_target(host, hosts)
         # Kill any stale ping processes before starting fresh
-        host.cmd("pkill -f 'ping -c 100' 2>/dev/null; pkill -f 'ping -c 300' 2>/dev/null; pkill -f 'baseline-ping' 2>/dev/null; true")
+        host.cmd("pkill -f 'ping -c 50' 2>/dev/null; pkill -f 'ping -c 300' 2>/dev/null; pkill -f 'baseline-ping' 2>/dev/null; true")
 
-        # Burst phase — 100 pkts at 10 pps = ~10s, fills flow table fast
+        # Burst phase — 50 pkts at 20 pps = ~2.5s, fills flow table fast
         host.cmd(
-            f"ping -c 100 -i {BASELINE_BURST_INTERVAL} {target} > /dev/null 2>&1 &"
+            f"ping -c 50 -i {BASELINE_BURST_INTERVAL} {target} > /dev/null 2>&1 &"
         )
 
         # Stream 1: infinite ping at 5 pps — no -c so it never races against flow idle_timeout
@@ -732,7 +732,7 @@ def restore_baseline_for_ip(hosts: list, src_ip: str) -> bool:
     for host in hosts:
         if host.IP() == src_ip:
             # Kill any leftover finite-count or infinite pings for this host
-            host.cmd("pkill -f 'ping -c 100' 2>/dev/null; pkill -f 'ping -c 300' 2>/dev/null; pkill -f 'ping -i' 2>/dev/null; true")
+            host.cmd("pkill -f 'ping -c 50' 2>/dev/null; pkill -f 'ping -c 300' 2>/dev/null; pkill -f 'ping -i' 2>/dev/null; true")
             others = [
                 h for h in hosts
                 if h.IP() != src_ip and int(h.name[1:]) not in _ATTACKER_NUMS
@@ -890,20 +890,20 @@ if __name__ == "__main__":
 
     info("*** Waiting for switches to connect to Ryu...\n")
     _ryu_ready = False
-    for _wait_i in range(16):  # 16 × 0.5s = 8s max
-        time.sleep(0.5)
+    for _wait_i in range(20):  # 20 × 0.3s = 6s max
+        time.sleep(0.3)
         try:
             import urllib.request as _ur
             with _ur.urlopen("http://127.0.0.1:8080/v1.0/topology/switches", timeout=1) as _r:
                 _switches = __import__("json").loads(_r.read())
             if len(_switches) >= 20:
-                info(f"*** All {len(_switches)} switches connected ({(_wait_i+1)*0.5:.1f}s)\n")
+                info(f"*** All {len(_switches)} switches connected ({(_wait_i+1)*0.3:.1f}s)\n")
                 _ryu_ready = True
                 break
             else:
                 info(f"    {len(_switches)}/20 switches connected...\n")
         except Exception:
-            info(f"    Waiting for Ryu... ({(_wait_i+1)*0.5:.1f}s)\n")
+            info(f"    Waiting for Ryu... ({(_wait_i+1)*0.3:.1f}s)\n")
     if not _ryu_ready:
         info("*** Timeout waiting for all switches — proceeding anyway.\n")
 
@@ -911,7 +911,7 @@ if __name__ == "__main__":
 
     info("*** Starting baseline normal traffic...\n")
     start_baseline_traffic(hosts)
-    time.sleep(1)
+    time.sleep(0.5)
 
     _warmup_macs(net, hosts)
 
@@ -919,7 +919,7 @@ if __name__ == "__main__":
     start_baseline_traffic(hosts)
 
     info("*** Waiting for baseline pings to register...\n")
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     # Feature 2: start restore poller before handing off to CLI
     _start_restore_poller(hosts)

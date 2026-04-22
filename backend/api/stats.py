@@ -8,9 +8,13 @@ bp = Blueprint("stats", __name__)
 
 @bp.get("/api/stats")
 def stats():
+    # get_stats() returns raw_total (ZMQ cumulative) and real malicious counts.
+    # This is the correct single source of truth — do NOT mix with traffic_summary
+    # SUM which blends per-packet counts with per-flow counts and goes into millions.
+    # (Cards and live chart both use the same ZMQ-backed counters so they stay in sync.)
     session = get_stats()
-    raw     = get_raw_counts()
 
+    raw     = get_raw_counts()
     raw_total = raw["raw_total"]
     malicious = session.get("malicious_dropped", 0)
 
