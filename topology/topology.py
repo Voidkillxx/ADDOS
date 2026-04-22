@@ -172,16 +172,16 @@ def start_baseline_traffic(hosts: list) -> None:
     for host in legit:
         target = _get_baseline_target(host, hosts)
         # Kill any stale ping processes before starting fresh
-        host.cmd("pkill -f 'ping -c 150' 2>/dev/null; pkill -f 'ping -c 30' 2>/dev/null; pkill -f 'ping -i' 2>/dev/null; true")
+        host.cmd("pkill -f 'ping -c 100' 2>/dev/null; pkill -f 'ping -c 300' 2>/dev/null; pkill -f 'baseline-ping' 2>/dev/null; true")
 
         # Burst phase — 100 pkts at 10 pps = ~10s, fills flow table fast
         host.cmd(
             f"ping -c 100 -i {BASELINE_BURST_INTERVAL} {target} > /dev/null 2>&1 &"
         )
 
-        # Stream 1: primary target — large batch (300 pkts) so gaps are rare, auto-restarts
+        # Stream 1: infinite ping at 5 pps — no -c so it never races against flow idle_timeout
         host.cmd(
-            f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target}; done) > /dev/null 2>&1 &"
+            f"ping -i {BASELINE_CONT_INTERVAL} {target} > /dev/null 2>&1 &"
         )
 
         # Stream 2: second legit target for more visible baseline traffic
@@ -190,14 +190,14 @@ def start_baseline_traffic(hosts: list) -> None:
         if other_hosts:
             target2 = other_hosts[0].IP()
             host.cmd(
-                f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target2}; done) > /dev/null 2>&1 &"
+                f"ping -i {BASELINE_CONT_INTERVAL} {target2} > /dev/null 2>&1 &"
             )
 
         # Stream 3: third legit target — spreads traffic across subnets
         if len(other_hosts) > 1:
             target3 = other_hosts[1].IP()
             host.cmd(
-                f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target3}; done) > /dev/null 2>&1 &"
+                f"ping -i {BASELINE_CONT_INTERVAL} {target3} > /dev/null 2>&1 &"
             )
 
 
@@ -731,7 +731,8 @@ def restore_baseline_for_ip(hosts: list, src_ip: str) -> bool:
     """Restart baseline ping for the host with the given IP."""
     for host in hosts:
         if host.IP() == src_ip:
-            host.cmd("pkill -f 'ping -c 30' 2>/dev/null; pkill -f 'ping -i' 2>/dev/null; true")
+            # Kill any leftover finite-count or infinite pings for this host
+            host.cmd("pkill -f 'ping -c 100' 2>/dev/null; pkill -f 'ping -c 300' 2>/dev/null; pkill -f 'ping -i' 2>/dev/null; true")
             others = [
                 h for h in hosts
                 if h.IP() != src_ip and int(h.name[1:]) not in _ATTACKER_NUMS
@@ -740,22 +741,22 @@ def restore_baseline_for_ip(hosts: list, src_ip: str) -> bool:
                 _restore_log.warning("No valid target for %s baseline restore", src_ip)
                 return False
 
-            # Restart all 3 streams just like start_baseline_traffic does
+            # Restart as infinite pings — no -c so flow idle_timeout never kills a batch
             target = others[0].IP()
             host.cmd(
-                f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target}; done) > /dev/null 2>&1 &"
+                f"ping -i {BASELINE_CONT_INTERVAL} {target} > /dev/null 2>&1 &"
             )
             if len(others) > 1:
                 target2 = others[1].IP()
                 host.cmd(
-                    f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target2}; done) > /dev/null 2>&1 &"
+                    f"ping -i {BASELINE_CONT_INTERVAL} {target2} > /dev/null 2>&1 &"
                 )
             if len(others) > 2:
                 target3 = others[2].IP()
                 host.cmd(
-                    f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target3}; done) > /dev/null 2>&1 &"
+                    f"ping -i {BASELINE_CONT_INTERVAL} {target3} > /dev/null 2>&1 &"
                 )
-            _restore_log.info("Restored baseline for %s (3x ping -i %s)", src_ip, BASELINE_CONT_INTERVAL)
+            _restore_log.info("Restored baseline for %s (3x infinite ping -i %s)", src_ip, BASELINE_CONT_INTERVAL)
             return True
     _restore_log.warning("Host %s not found — skipping restore", src_ip)
     return False
@@ -774,17 +775,35 @@ def _restore_poller_loop(hosts: list) -> None:
             _restore_log.debug("Restore poller error: %s", exc)
 
 
+def _baseline_watchdog_loop(hosts: list) -> None:
+    """Safety net: every 30s verify each legit host has an infinite ping running.
+    Restarts it if dead (e.g. killed by quarantine, OOM, or accidental pkill)."""
+    import time as _wt
+    _wlog = _logging.getLogger("baseline-watchdog")
+    while True:
+        _wt.sleep(30)
+        for host in hosts:
+            try:
+                if int(host.name[1:]) in _ATTACKER_NUMS:
+                    continue
+                ps = host.cmd("pgrep -af 'ping -i' 2>/dev/null").strip()
+                if not ps:
+                    restore_baseline_for_ip(hosts, host.IP())
+            except Exception as exc:
+                _wlog.debug("Watchdog check error %s: %s", host.name, exc)
+
+
 def _start_restore_poller(hosts: list) -> None:
-    """Start the auto-restoration poller. Call once just before TopologyCLI(net)."""
-    t = threading.Thread(
-        target=_restore_poller_loop,
-        args=(hosts,),
-        name="restore-poller",
-        daemon=True,
-    )
+    """Start the auto-restoration poller + baseline watchdog. Call once before TopologyCLI."""
+    t = threading.Thread(target=_restore_poller_loop, args=(hosts,),
+                         name="restore-poller", daemon=True)
     t.start()
-    info(f"*** Auto-restore poller started (polling {BACKEND_API} every "
-         f"{RESTORE_POLL_S:.0f}s)\n")
+    info(f"*** Auto-restore poller started (polling {BACKEND_API} every {RESTORE_POLL_S:.0f}s)\n")
+
+    w = threading.Thread(target=_baseline_watchdog_loop, args=(hosts,),
+                         name="baseline-watchdog", daemon=True)
+    w.start()
+    info("*** Baseline watchdog started (checks every 30s)\n")
 
 
 # ==================================================================

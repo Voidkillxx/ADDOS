@@ -294,7 +294,7 @@ class FatTreeController(app_manager.RyuApp):
             if msg.buffer_id != ofp.OFP_NO_BUFFER:
                 mod = parser.OFPFlowMod(
                     datapath=dp, priority=1,
-                    idle_timeout=60, hard_timeout=0,
+                    idle_timeout=300, hard_timeout=0,
                     buffer_id=msg.buffer_id,
                     match=match, instructions=inst)
                 dp.send_msg(mod)
@@ -302,7 +302,7 @@ class FatTreeController(app_manager.RyuApp):
             else:
                 mod = parser.OFPFlowMod(
                     datapath=dp, priority=1,
-                    idle_timeout=60, hard_timeout=0,
+                    idle_timeout=300, hard_timeout=0,
                     match=match, instructions=inst)
                 dp.send_msg(mod)
 
