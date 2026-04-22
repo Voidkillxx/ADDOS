@@ -788,6 +788,7 @@ def _baseline_watchdog_loop(hosts: list) -> None:
                     continue
                 ps = host.cmd("pgrep -af 'ping -i' 2>/dev/null").strip()
                 if not ps:
+                    #_wlog.warning("Baseline dead on %s (%s) — restarting", host.name, host.IP())
                     restore_baseline_for_ip(hosts, host.IP())
             except Exception as exc:
                 _wlog.debug("Watchdog check error %s: %s", host.name, exc)
