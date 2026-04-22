@@ -30,8 +30,13 @@ INFERENCE_CACHE_TTL_S   = 3.0  # Lowered from 10s — faster re-evaluation durin
                                # for Phase 1 observation (now 3-5s).
 WORKER_QUEUE_MAXSIZE    = 1000
 WORKER_ITEM_TIMEOUT_S   = 3.0
-EXTRACTION_TRIGGER_PKTS = 2    # Minimum packets before inference
-EXTRACTION_TRIGGER_S    = 0.1  # Minimum flow age before inference
+EXTRACTION_TRIGGER_PKTS = 1    # BUG 3 FIX: lowered from 2 — single-packet flows reach inference
+EXTRACTION_TRIGGER_S    = 0.05 # BUG 3 FIX: lowered from 0.1 — faster early-attack detection
+
+# --- Simulation mode ---
+# BUG 2 FIX: set True for demo/testing so ban durations are short and
+# SSE dedup is fast. Set False for production.
+SIMULATION_MODE = True
 
 # --- SYN pre-filter ---
 SYN_HALFOPEN_LIMIT  = 100

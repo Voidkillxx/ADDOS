@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 from backend.database import writer
+from backend.config import SIMULATION_MODE
 
 log = logging.getLogger(__name__)
 
@@ -14,9 +15,14 @@ log = logging.getLogger(__name__)
 PHASE1_DURATION_LOW  = 3.0   # Lowered from 10s for faster demo detection
 PHASE1_DURATION_HIGH = 5.0   # Lowered from 15s for faster demo detection
 
-# Phase 2 — Time Ban: escalating bans, max 30 min (1800s)
-# Each re-offence doubles the ban: 2min → 5min → 10min → 30min
-BAN_LEVELS     = [120, 300, 600, 1800]   # seconds per escalation level
+# Phase 2 — Time Ban: escalating bans
+# BUG 2 FIX: use short durations in SIMULATION_MODE so testers see full
+# attack-detect-ban-release cycles without waiting 30 minutes.
+if SIMULATION_MODE:
+    BAN_LEVELS = [30, 60, 120, 300]   # seconds — short for simulation/demo
+    log.warning("SIMULATION_MODE is ON — using short ban durations for testing: %s", BAN_LEVELS)
+else:
+    BAN_LEVELS = [120, 300, 600, 1800]  # seconds — production (2min→5min→10min→30min)
 MAX_BAN_LEVEL  = len(BAN_LEVELS) - 1
 
 # Phase 3 — Blackhole: full drop, 1hr TTL then auto-release
@@ -191,7 +197,14 @@ class StateMachine:
                     offence_count = 1,
                 )
                 self._states[src_ip] = state
-                # Apply rate limit immediately during quarantine observation
+                # Apply BOTH quarantine (priority 90) AND rate_limit (priority 80)
+                # simultaneously on Phase 1 entry.
+                # SLIP-THROUGH FIX: previously only rate_limit (priority 80) was sent.
+                # Priority 80 is the weakest drop rule — most attacker packets still
+                # slipped through. Quarantine (priority 90) is stronger and drops
+                # more aggressively. Sending both ensures maximum coverage across
+                # all switches from the moment of first detection.
+                self._push_command(src_ip, "quarantine")
                 self._push_command(src_ip, "rate_limit")
                 log.info("Phase 1 Quarantine+RateLimit: %s  (conf=%.1f%%  vector=%s  priority=%s  duration=%.0fs)",
                          src_ip, confidence * 100, attack_class, _prio, state.phase1_duration())
@@ -274,8 +287,9 @@ class StateMachine:
         recent_pps = getattr(state, "recent_pps", None)
 
         score_elevated = state.if_score >= thr
-        # pps threshold: > 5.0 means still actively flooding; < 5.0 likely stopped
-        pps_elevated   = (recent_pps is None) or (recent_pps > 5.0)
+        # pps threshold lowered 5.0→1.0 to match new flood gate in worker/ryu.
+        # Previously attackers at 2-4 pps were released instead of escalated.
+        pps_elevated   = (recent_pps is None) or (recent_pps > 1.0)
 
         if score_elevated and pps_elevated:
             # Both signals agree: attack persisted — escalate
@@ -284,7 +298,7 @@ class StateMachine:
             reason = (
                 f"score normalized (IF={state.if_score:.4f} < thr={thr:.4f})"
                 if not score_elevated
-                else f"traffic stopped (pps={recent_pps:.1f} <= 5.0)"
+                else f"traffic stopped (pps={recent_pps:.1f} <= 1.0)"
             )
             log.info("Phase1 complete: %s %s — releasing", src_ip, reason)
             self._clear(src_ip, reason="Attack Stopped")

@@ -144,11 +144,11 @@ def _parse_and_route(raw: bytes) -> None:
         # delta=0 check removed — submit anyway so ip_proto reaches RF
         # worker guards against zero-packet flows internally
 
-        # Lowered MIN_PPS 20.0->2.0 and flood threshold 80.0->20.0
-        # to match ryu_controller and worker gates for faster detection
-        MIN_PPS          = 2.0
+        # Lowered MIN_PPS 2.0→0.5 so early-stage ICMP/UDP flows (which build
+        # up slowly in OVS) reach the worker before pps is fully elevated.
+        MIN_PPS          = 0.5
         switch_delta_pps = float(flow_stats.get("switch_delta_pps", 0.0))
-        is_flood_mode    = switch_delta_pps >= 20.0
+        is_flood_mode    = switch_delta_pps >= 1.0  # match worker/ryu flood gate
 
         crosses_threshold = (
             pkt_count_cumulative >= 1

@@ -16,7 +16,7 @@ from ryu.lib import hub
 
 TELEMETRY_ADDR = "tcp://127.0.0.1:5555"
 COMMAND_ADDR   = "tcp://127.0.0.1:5556"
-STATS_INTERVAL = 0.5  # Lowered from 2.0s — faster attack detection
+STATS_INTERVAL = 1.0  # Balanced: fast enough for demo, light enough for VMware
 
 
 class FatTreeController(app_manager.RyuApp):
@@ -61,7 +61,6 @@ class FatTreeController(app_manager.RyuApp):
         self._blocked_prev_pkts: dict[str, int] = {}  # src_ip → last seen pkt_count
 
         self._pkt_in_count: dict = collections.defaultdict(int)
-        # _pkt_in_ts removed — was initialized but never read or written anywhere.
 
         self._port_counts: dict = collections.defaultdict(int)
 
@@ -69,6 +68,12 @@ class FatTreeController(app_manager.RyuApp):
         # Throttled packets check this before forwarding so banned IPs
         # are dropped even when the flow table is bypassed by OFPPacketOut.
         self._banned_ips: set = set()
+
+        # Cooldown tracker: after stop_all_attacks() clears IPs, suppress
+        # is_flood_switch for 2 polling intervals so baseline isn't flagged.
+        # Key: dpid → intervals_remaining
+        self._cooldown_intervals: dict[int, int] = {}
+        self._COOLDOWN_INTERVALS = 3  # suppress flood detection for N intervals after clear
 
         # Track dominant ip_proto per switch per polling interval.
         # Counts {dpid: {proto_num: count}} — reset each FlowStats reply.
@@ -86,7 +91,7 @@ class FatTreeController(app_manager.RyuApp):
         # per-src-IP flow rules. This prevents 19M+ flow entries overwhelming OVS
         # and Ryu's event loop crashing under --rand-source --flood attacks.
         self._pkt_in_rate: dict = {}   # dpid → (count, window_start)
-        self._PKT_IN_RATE_LIMIT = 200  # PacketIn/s per switch before throttle
+        self._PKT_IN_RATE_LIMIT = 150  # Reduced from 200 — safer for VMware without losing attack visibility
 
         hub.spawn(self._stats_poll_loop)
         hub.spawn(self._command_listener)
@@ -164,19 +169,6 @@ class FatTreeController(app_manager.RyuApp):
         in_port = msg.match["in_port"]
 
         # ── Rate limiter — MUST be FIRST, before any parsing ──────────────────
-        # Root cause of switch disconnections during rand-source flood:
-        # Old code checked the rate AFTER packet parsing, MAC learning, and ZMQ
-        # push. Every flood packet still triggered all that expensive processing
-        # → gevent event loop saturated → switches timed out and disconnected
-        # → FlowStats polling stopped → zero detections.
-        #
-        # Fix: check rate at the very top. If throttled, count the packet for
-        # rate_pkt_in (critical for flood detection) then forward immediately
-        # with zero other processing. This reduces per-packet cost from ~50μs
-        # to ~2μs for throttled packets, keeping the event loop healthy.
-        #
-        # ARP packets bypass throttling — they are low-volume and critical for
-        # connectivity. Only IPv4 flood packets are throttled.
         now_mono    = time.monotonic()
         _rate_entry = self._pkt_in_rate.get(dpid, (0, now_mono))
         _rate_count, _rate_start = _rate_entry
@@ -188,19 +180,9 @@ class FatTreeController(app_manager.RyuApp):
             self._pkt_in_rate[dpid] = (_rate_count, _rate_start)
             _throttled = (_rate_count > self._PKT_IN_RATE_LIMIT)
 
-        # Minimal fast-path for throttled IPv4 packets:
-        # Count for rate_pkt_in (flood signal), forward via flood, return.
-        # We check ethertype cheaply from the raw frame without full parsing.
         if _throttled:
-            # Still count for rate_pkt_in — this is how switch_delta_pps
-            # detects the flood even when no flow rules are being installed.
             self._pkt_in_count[dpid] += 1
 
-            # Bug fix: check if src IP is banned before forwarding.
-            # Previously ALL throttled packets were forwarded via OFPPacketOut
-            # which bypasses the OVS flow table entirely — so banned IPs kept
-            # getting their packets forwarded even during a Time Ban/Blackhole.
-            # We need to parse just enough to get src_ip for the ban check.
             try:
                 _raw_pkt = packet.Packet(msg.data)
                 _raw_ip  = _raw_pkt.get_protocol(ipv4.ipv4)
@@ -274,11 +256,7 @@ class FatTreeController(app_manager.RyuApp):
         # Count for rate_pkt_in
         self._pkt_in_count[dpid] += 1
 
-        # Track protocol per (switch, src_ip) — used to inject correct proto per flow.
-        # Also track switch-wide for dominant_proto fallback.
         # F5 fix: _src_proto stores the MOST RECENT proto seen for each src_ip
-        # (direct assignment, not increment) — this way if an IP is seen with a
-        # new protocol it updates immediately instead of accumulating old counts.
         if ip4.proto:
             self._switch_proto[dpid][ip4.proto] += 1
             self._src_proto[dpid][src_ip] = ip4.proto   # overwrite with latest
@@ -304,16 +282,11 @@ class FatTreeController(app_manager.RyuApp):
 
         actions = [parser.OFPActionOutput(out_port)]
 
-        # Install flow rule WITH ip_proto in match — critical for RF classification.
-        # Without ip_proto in match, OVS creates ONE rule per src_ip matching all
-        # protocols. FlowStats then has no ip_proto field → RF always gets proto=0
-        # → falls back to ICMP. With ip_proto in match, OVS creates separate entries
-        # per (src_ip, proto): TCP=6, ICMP=1, UDP=17 — RF gets the real protocol.
         if out_port != ofp.OFPP_FLOOD and ip4.proto:
             match = parser.OFPMatch(
                 in_port=in_port,
                 eth_type=0x0800,
-                ip_proto=ip4.proto,  # KEY FIX: separate flow entry per protocol
+                ip_proto=ip4.proto,
                 ipv4_src=src_ip,
                 eth_dst=eth.dst,
             )
@@ -321,15 +294,15 @@ class FatTreeController(app_manager.RyuApp):
             if msg.buffer_id != ofp.OFP_NO_BUFFER:
                 mod = parser.OFPFlowMod(
                     datapath=dp, priority=1,
-                    idle_timeout=60, hard_timeout=0,  # raised 10→60s: baseline ping at 1pps
-                    buffer_id=msg.buffer_id,           # was expiring after 10s idle causing
-                    match=match, instructions=inst)    # packet_count reset and UI counter drop
+                    idle_timeout=60, hard_timeout=0,
+                    buffer_id=msg.buffer_id,
+                    match=match, instructions=inst)
                 dp.send_msg(mod)
                 return
             else:
                 mod = parser.OFPFlowMod(
                     datapath=dp, priority=1,
-                    idle_timeout=60, hard_timeout=0,  # raised 10→60s: same fix
+                    idle_timeout=60, hard_timeout=0,
                     match=match, instructions=inst)
                 dp.send_msg(mod)
 
@@ -359,15 +332,13 @@ class FatTreeController(app_manager.RyuApp):
         agg["last_reply_ts"] = now
         agg["disp_interval"] = max(interval, 0.001)
 
-        # Reset switch-wide proto counter each interval (used as fallback only).
-        # F5 fix: _src_proto (per-src-ip persistent cache) is intentionally
-        # NEVER cleared — once a src_ip's protocol is seen via PacketIn it stays
-        # known forever across intervals. This is critical for mixed campaigns:
-        # after flow rules install, PacketIn stops firing for that IP, but
-        # _src_proto still returns the correct protocol (ICMP=1, TCP=6, UDP=17)
-        # so RF always gets the right ip_proto, not the switch-wide dominant one.
         # Only the switch-wide _switch_proto is reset (it's a per-interval tally).
+        # _src_proto (per-src-ip persistent cache) is intentionally NEVER cleared.
         self._switch_proto[dpid].clear()
+
+        # Tick down cooldown counter for this switch each polling interval.
+        if self._cooldown_intervals.get(dpid, 0) > 0:
+            self._cooldown_intervals[dpid] -= 1
 
         total_pkt  = 0
         total_byte = 0
@@ -375,30 +346,19 @@ class FatTreeController(app_manager.RyuApp):
         dst_ips    = set()
         src_ips    = set()
 
-        # ── Bug 1 fix: compute rate_pkt_in BEFORE the per-flow loop ─────────────
-        # rate_pkt_in counts ALL PacketIn events this interval, including throttled
-        # rand-source packets that have NO OVS flow rule installed.
-        # The old code computed it AFTER the loop → the flood gate inside the loop
-        # never saw it → switch_delta_pps based only on flow table entries (which
-        # excluded throttled packets) → is_flood_switch stayed False → all
-        # rand-source flows filtered by pkt_count >= 50 gate → zero detections.
+        # Bug 1 fix: compute rate_pkt_in BEFORE the per-flow loop
         _rate_pkt_in_now = self._pkt_in_count.get(dpid, 0) / max(interval, 0.001)
         self._pkt_in_count[dpid] = 0   # reset immediately after reading
 
         _sw_total_now = sum(s.packet_count for s in body)
         _prev_entry   = self._switch_prev_total.get(dpid)
         if _prev_entry is None:
-            # First poll — record baseline, skip this delta (no prev to diff against)
             self._switch_prev_total[dpid] = _sw_total_now
             agg["switch_delta_pps"] = 0.0
         else:
             _sw_delta = max(_sw_total_now - _prev_entry, 0)
             self._switch_prev_total[dpid] = _sw_total_now
             _flow_based_delta_pps = _sw_delta / max(interval, 0.1)
-            # Use the HIGHER of flow-table delta and PacketIn rate.
-            # During throttled rand-source flood: flow delta is low (only ~500
-            # rules installed), but rate_pkt_in captures all events including
-            # the millions of throttled packets → correctly signals flood mode.
             agg["switch_delta_pps"] = max(_flow_based_delta_pps, _rate_pkt_in_now)
 
         for stat in body:
@@ -414,9 +374,6 @@ class FatTreeController(app_manager.RyuApp):
                 dst_ips.add(match["ipv4_dst"])
 
             # F3 fix: detect blocked flow entries (priority 80/90/100 = drop rules)
-            # and compute delta packets since last poll → real physical drop count.
-            # Push as a separate ZMQ "dropped_delta" message so backend can
-            # accumulate the true malicious_dropped counter accurately.
             if stat.priority in (80, 90, 100):
                 _blocked_src = match.get("ipv4_src")
                 if _blocked_src:
@@ -442,33 +399,25 @@ class FatTreeController(app_manager.RyuApp):
                 continue
 
             switch_delta_pps = agg.get("switch_delta_pps", 0.0)
-            # Lowered from 80 to 20 for faster flood detection in Mininet VM
-            is_flood_switch  = switch_delta_pps >= 20.0
+
+            # Cooldown: if we just cleared an attack, suppress flood detection
+            # for _COOLDOWN_INTERVALS intervals so baseline isn't misclassified.
+            _cooldown_left = self._cooldown_intervals.get(dpid, 0)
+            if _cooldown_left > 0:
+                is_flood_switch = False  # grace period — treat as normal
+            else:
+                is_flood_switch = switch_delta_pps >= 1.0
 
             if is_flood_switch:
-                # Flood mode: submit every flow with >= 1 pkt (catches rand-source).
-                # rand-source attacks: each flow has pkt_count=1 and unique src IP.
-                # They ONLY reach the backend via flood mode — non-flood gate
-                # requires pkt_count >= 50 which rand-source flows never reach.
                 if stat.packet_count < 1:
                     continue
             else:
-                # Normal mode: minimum 1 packet, cumulative pps >= 0.5
-                # Baseline ping at 1pps starts ~1.0 cumulative pps but drops
-                # toward 0.5 as the flow ages. Worker ML gate (pps < 1.0) still
-                # blocks ML inference — only reporting as normal traffic.
-                if stat.packet_count < 1 or pps < 0.5:
+                if stat.packet_count < 1 or pps < 0.05:  # lowered from 0.5 — catches ICMP/UDP early
                     continue
 
-            # Get ip_proto for this flow:
-            # 1. From OVS flow match (new rules installed with ip_proto in match)
-            # 2. From persistent _src_proto cache (populated by PacketIn, never cleared)
-            # The persistent cache ensures protocol is known even after flow rules
-            # install and PacketIn stops firing for that src_ip.
             _flow_ip_proto = int(match.get("ip_proto", 0))
             if not _flow_ip_proto:
                 _flow_ip_proto = int(self._src_proto[dpid].get(src_ip, 0))
-            # Last resort: switch-wide dominant proto
             if not _flow_ip_proto:
                 proto_counts = self._switch_proto.get(dpid, {})
                 if proto_counts:
@@ -503,10 +452,7 @@ class FatTreeController(app_manager.RyuApp):
         agg["g_usip"]       = src_ips
         agg["avg_flow_dst"] = len(dst_ips)
         agg["avg_durat"]    = (sum(durations) / n_flows) if durations else 0.0
-
-        # rate_pkt_in was already computed and reset BEFORE the per-flow loop
-        # (Bug 1 fix). Store the value we already computed for RF feature use.
-        agg["rate_pkt_in"] = _rate_pkt_in_now
+        agg["rate_pkt_in"]  = _rate_pkt_in_now
 
     # ------------------------------------------------------------------
     # PortStats reply
@@ -528,6 +474,7 @@ class FatTreeController(app_manager.RyuApp):
             for dpid, dp in list(self._datapaths.items()):
                 self._request_flow_stats(dp)
                 self._request_port_stats(dp)
+                hub.sleep(0.04)  # 40ms stagger — prevents blasting all 20 switches at once (VMware fix)
 
     def _request_flow_stats(self, dp):
         parser = dp.ofproto_parser
@@ -579,12 +526,48 @@ class FatTreeController(app_manager.RyuApp):
             self._banned_ips.discard(src_ip)
             # F3 fix: reset drop counter so a re-offending IP starts fresh
             self._blocked_prev_pkts.pop(src_ip, None)
+            # BUG FIX: also purge stale cached protocol for this IP across all switches.
+            # Without this, the old attack protocol (ICMP/TCP/UDP) stays in _src_proto
+            # and gets re-injected into RF features after the IP resumes normal traffic,
+            # causing misclassification on the next legitimate flow from that IP.
+            for dpid_key in list(self._src_proto.keys()):
+                self._src_proto[dpid_key].pop(src_ip, None)
+            # BUG FIX: reset switch_prev_total so stale attack packet_count deltas
+            # don't carry over into the next polling interval after stop_all_attacks().
+            # Without this, the switch_delta_pps stays abnormally high for 1-2 intervals
+            # after the attack stops, causing baseline pings to be flagged as flood traffic.
+            for dpid_key in list(self._switch_prev_total.keys()):
+                self._switch_prev_total.pop(dpid_key, None)
+            # Also reset pkt_in_count per switch so rate_pkt_in drops to zero cleanly.
+            for dpid_key in list(self._pkt_in_count.keys()):
+                self._pkt_in_count[dpid_key] = 0
+            # Cooldown: suppress is_flood_switch for N intervals on all switches
+            # so baseline traffic right after stop_all_attacks() isn't misclassified.
+            for dpid_key in list(self._datapaths.keys()):
+                self._cooldown_intervals[dpid_key] = self._COOLDOWN_INTERVALS
 
         for dpid, dp in list(self._datapaths.items()):
             parser = dp.ofproto_parser
             ofp    = dp.ofproto
 
             match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip)
+
+            # SLIP-THROUGH FIX: before installing any drop rule, delete ALL existing
+            # forwarding flow entries for this src_ip across ALL switches.
+            # Without this, priority=1 forwarding rules installed by packet_in_handler
+            # (which have more specific matches: in_port + ip_proto + eth_dst) can
+            # still match and FORWARD attacker packets even after a priority=80/90/100
+            # drop rule is installed — OVS picks the most specific match, not just
+            # the highest priority, when match fields differ.
+            if action in ("block", "quarantine", "rate_limit"):
+                flush_mod = parser.OFPFlowMod(
+                    datapath  = dp,
+                    command   = ofp.OFPFC_DELETE,
+                    out_port  = ofp.OFPP_ANY,
+                    out_group = ofp.OFPG_ANY,
+                    priority  = 1,
+                    match     = match)
+                dp.send_msg(flush_mod)
 
             if action == "block":
                 # ttl=None → permanent manual block (hard_timeout=0)
