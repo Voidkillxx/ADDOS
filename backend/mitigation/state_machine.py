@@ -12,8 +12,8 @@ log = logging.getLogger(__name__)
 # ── Phase durations ────────────────────────────────────────────────────────────
 # Phase 1 — Quarantine + Rate Limit:
 #   15s for Low severity, 30s for High severity — faster response
-PHASE1_DURATION_LOW  = 3.0   # Lowered from 10s for faster demo detection
-PHASE1_DURATION_HIGH = 5.0   # Lowered from 15s for faster demo detection
+PHASE1_DURATION_LOW  = 1.0   # Lowered from 3s → 1s for SIMULATION_MODE instant demo
+PHASE1_DURATION_HIGH = 2.0   # Lowered from 5s → 2s for SIMULATION_MODE instant demo
 
 # Phase 2 — Time Ban: escalating bans
 # BUG 2 FIX: use short durations in SIMULATION_MODE so testers see full
@@ -287,9 +287,11 @@ class StateMachine:
         recent_pps = getattr(state, "recent_pps", None)
 
         score_elevated = state.if_score >= thr
-        # pps threshold lowered 5.0→1.0 to match new flood gate in worker/ryu.
-        # Previously attackers at 2-4 pps were released instead of escalated.
-        pps_elevated   = (recent_pps is None) or (recent_pps > 1.0)
+        # BUG FIX: was (recent_pps is None) or (recent_pps > 1.0) — this treated
+        # a missing pps reading as "still elevated", escalating IPs that had already
+        # stopped attacking to a time ban. None means no recent flow data = traffic
+        # stopped, so default to NOT elevated (False), causing a clean release.
+        pps_elevated   = (recent_pps is not None) and (recent_pps > 1.0)
 
         if score_elevated and pps_elevated:
             # Both signals agree: attack persisted — escalate

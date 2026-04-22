@@ -394,13 +394,57 @@ def stop_all_attacks(net):
             info(f"    cleared: {ip}\n")
         _sock.close()
         info("    Controller state cleared.\n")
-        # BUG FIX: wait for controller cooldown intervals to tick down before
-        # baseline restarts. Without this, the first baseline pings arrive while
-        # switch_delta_pps is still elevated from the attack, causing them to be
-        # misclassified as flood traffic. 4s = 3 x STATS_INTERVAL(1.0s) + 1s buffer.
-        info("*** Waiting 4s for controller cooldown (prevents baseline false-positive)...\n")
-        time.sleep(4)
-        info("    Cooldown complete — safe to restart baseline traffic.\n")
+
+        # SIMULATION FIX: flush backend state IMMEDIATELY before the cooldown
+        # sleep so legit traffic is unblocked as fast as possible.
+        # Step 1 — flush inference cache so worker re-runs IF on normal traffic.
+        # Step 2 — clear_all wipes all Phase 1 quarantine states AND sends OVS
+        #          "clear" for every quarantined IP so legit hosts stop being
+        #          blocked at the switch level instantly.
+        info("*** Flushing backend cache + quarantine states instantly...\n")
+        try:
+            import urllib.request as _ur2
+            import json as _json2
+
+            # Step 1: invalidate inference cache per attacker IP
+            for _ip in attacker_ips:
+                try:
+                    _req = _ur2.Request(
+                        "http://127.0.0.1:5000/api/cache/invalidate",
+                        data=_json2.dumps({"src_ip": _ip}).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with _ur2.urlopen(_req, timeout=2):
+                        pass
+                    info(f"    cache cleared: {_ip}\n")
+                except Exception as _ce:
+                    info(f"    cache clear warning for {_ip}: {_ce}\n")
+
+            # Step 2: wipe ALL non-permanent quarantine states immediately —
+            # sends OVS "clear" per quarantined IP so legit traffic is
+            # forwarded without waiting for phase1 to time out.
+            try:
+                _req2 = _ur2.Request(
+                    "http://127.0.0.1:5000/api/quarantine/clear_all",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with _ur2.urlopen(_req2, timeout=2) as _r2:
+                    _resp2 = _json2.loads(_r2.read())
+                info(f"    quarantine cleared: {_resp2.get('cleared', 0)} entries\n")
+            except Exception as _ce2:
+                info(f"    quarantine clear warning: {_ce2}\n")
+
+        except Exception as _e2:
+            info(f"    Warning: backend flush failed: {_e2}\n")
+
+        # Reduced 4s → 1s: cache + quarantine already cleared above,
+        # only need a short pause for switch_delta_pps to settle.
+        info("*** Waiting 1s for switch stats to settle...\n")
+        time.sleep(1)
+        info("    Done — forwarding restored.\n")
     except Exception as e:
         info(f"    Warning: could not clear controller state via ZMQ: {e}\n")
         info("    (OVS rules are flushed; backend will self-clear after TTL expiry)\n")

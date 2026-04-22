@@ -24,10 +24,9 @@ ZMQ_COMMAND_ADDR   = "tcp://127.0.0.1:5556"   # Backend PUSH → Ryu PULL
 
 # --- Pipeline tuning ---
 FLOW_TRACKER_CAP        = 500
-INFERENCE_CACHE_TTL_S   = 3.0  # Lowered from 10s — faster re-evaluation during
-                               # observation window. Phase 2/3 IPs are now skipped
-                               # entirely in zmq_receiver so cache TTL only matters
-                               # for Phase 1 observation (now 3-5s).
+INFERENCE_CACHE_TTL_S   = 1.0  # Lowered from 3s → 1s for SIMULATION_MODE —
+                               # faster re-evaluation so normal traffic is scored
+                               # correctly within 1s of attack stopping.
 WORKER_QUEUE_MAXSIZE    = 1000
 WORKER_ITEM_TIMEOUT_S   = 3.0
 EXTRACTION_TRIGGER_PKTS = 1    # BUG 3 FIX: lowered from 2 — single-packet flows reach inference
