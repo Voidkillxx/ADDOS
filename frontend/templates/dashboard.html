@@ -60,6 +60,7 @@
       <div class="logo-sub">Threat Detection &amp; Mitigation System</div>
     </div>
     <div class="header-right">
+      <div class="status-pill"><div class="dot"></div>System Active</div>
       <button class="theme-btn" id="theme-btn" onclick="toggleTheme()">☀ Light Mode</button>
       <button class="btn" onclick="openModal()">Generate Report</button>
     </div>
@@ -209,7 +210,6 @@
         <label>START DATE</label>
         <div class="date-input-row">
           <input class="date-text-input" id="r-start" placeholder="YYYY-MM-DD"
-                 maxlength="10" inputmode="numeric"
                  oninput="onDateType('start',this.value)"/>
           <div class="cal-dropdown" id="drop-start">
             <button class="cal-toggle-btn" onclick="toggleCal('start')" title="Pick date">📅</button>
@@ -232,7 +232,6 @@
         <label>END DATE</label>
         <div class="date-input-row">
           <input class="date-text-input" id="r-end" placeholder="YYYY-MM-DD"
-                 maxlength="10" inputmode="numeric"
                  oninput="onDateType('end',this.value)"/>
           <div class="cal-dropdown" id="drop-end">
             <button class="cal-toggle-btn" onclick="toggleCal('end')" title="Pick date">📅</button>
@@ -269,5 +268,6 @@
   window.MAX_LOG  = {{ max_log }};
 </script>
 <script src="/static/main.js"></script>
+<script src="/static/ip-drawer.js"></script>
 </body>
 </html>
