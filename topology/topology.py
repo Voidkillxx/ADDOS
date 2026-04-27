@@ -19,15 +19,15 @@ CONTROLLER_PORT = 6633
 # ------------------------------------------------------------------
 # Traffic volume constants
 # ------------------------------------------------------------------
-# BASELINE_BURST_INTERVAL: initial burst phase — 10 pps for ~15s
+# BASELINE_BURST_INTERVAL: initial burst phase — 20 pps for ~5s
 # Quickly fills OVS flow table and makes traffic visible on dashboard immediately.
-BASELINE_BURST_INTERVAL = "0.1"   # ping -i 0.1 → 10 pps
+BASELINE_BURST_INTERVAL = "0.05"  # ping -i 0.05 → 20 pps
 
-# BASELINE_CONT_INTERVAL: continuous traffic after burst — ~5 pps per stream
-# 3 streams × 5 pps = ~15 pps/host total → clearly visible on dashboard.
-# Each stream targets a different IP so no single switch sees all 15 pps from one IP.
+# BASELINE_CONT_INTERVAL: continuous traffic after burst — ~10 pps per stream
+# 3 streams x 10 pps = ~30 pps/host total -> clearly visible on dashboard.
+# Each stream targets a different IP so no single switch sees all 30 pps from one IP.
 # Still safely classified as Normal by Isolation Forest (spread across 3 targets).
-BASELINE_CONT_INTERVAL  = "0.2"   # ping -i 0.2 → 5 pps per stream
+BASELINE_CONT_INTERVAL  = "0.1"   # ping -i 0.1 -> 10 pps per stream
 
 # Attack volume for single (finite) attacks.
 ATTACK_PKT_COUNT = 5000   # 5k pkts at --flood takes ~2-3s in Mininet VM
@@ -172,16 +172,16 @@ def start_baseline_traffic(hosts: list) -> None:
     for host in legit:
         target = _get_baseline_target(host, hosts)
         # Kill any stale ping processes before starting fresh
-        host.cmd("pkill -f 'ping -c 150' 2>/dev/null; pkill -f 'ping -c 30' 2>/dev/null; pkill -f 'ping -i' 2>/dev/null; true")
+        host.cmd("pkill -f 'ping -c 50' 2>/dev/null; pkill -f 'ping -c 300' 2>/dev/null; pkill -f 'baseline-ping' 2>/dev/null; true")
 
-        # Burst phase — 100 pkts at 10 pps = ~10s, fills flow table fast
+        # Burst phase — 50 pkts at 20 pps = ~2.5s, fills flow table fast
         host.cmd(
-            f"ping -c 100 -i {BASELINE_BURST_INTERVAL} {target} > /dev/null 2>&1 &"
+            f"ping -c 50 -i {BASELINE_BURST_INTERVAL} {target} > /dev/null 2>&1 &"
         )
 
-        # Stream 1: primary target — large batch (300 pkts) so gaps are rare, auto-restarts
+        # Stream 1: infinite ping at 5 pps — no -c so it never races against flow idle_timeout
         host.cmd(
-            f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target}; done) > /dev/null 2>&1 &"
+            f"ping -i {BASELINE_CONT_INTERVAL} {target} > /dev/null 2>&1 &"
         )
 
         # Stream 2: second legit target for more visible baseline traffic
@@ -190,14 +190,14 @@ def start_baseline_traffic(hosts: list) -> None:
         if other_hosts:
             target2 = other_hosts[0].IP()
             host.cmd(
-                f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target2}; done) > /dev/null 2>&1 &"
+                f"ping -i {BASELINE_CONT_INTERVAL} {target2} > /dev/null 2>&1 &"
             )
 
         # Stream 3: third legit target — spreads traffic across subnets
         if len(other_hosts) > 1:
             target3 = other_hosts[1].IP()
             host.cmd(
-                f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target3}; done) > /dev/null 2>&1 &"
+                f"ping -i {BASELINE_CONT_INTERVAL} {target3} > /dev/null 2>&1 &"
             )
 
 
@@ -394,13 +394,57 @@ def stop_all_attacks(net):
             info(f"    cleared: {ip}\n")
         _sock.close()
         info("    Controller state cleared.\n")
-        # BUG FIX: wait for controller cooldown intervals to tick down before
-        # baseline restarts. Without this, the first baseline pings arrive while
-        # switch_delta_pps is still elevated from the attack, causing them to be
-        # misclassified as flood traffic. 4s = 3 x STATS_INTERVAL(1.0s) + 1s buffer.
-        info("*** Waiting 4s for controller cooldown (prevents baseline false-positive)...\n")
-        time.sleep(4)
-        info("    Cooldown complete — safe to restart baseline traffic.\n")
+
+        # SIMULATION FIX: flush backend state IMMEDIATELY before the cooldown
+        # sleep so legit traffic is unblocked as fast as possible.
+        # Step 1 — flush inference cache so worker re-runs IF on normal traffic.
+        # Step 2 — clear_all wipes all Phase 1 quarantine states AND sends OVS
+        #          "clear" for every quarantined IP so legit hosts stop being
+        #          blocked at the switch level instantly.
+        info("*** Flushing backend cache + quarantine states instantly...\n")
+        try:
+            import urllib.request as _ur2
+            import json as _json2
+
+            # Step 1: invalidate inference cache per attacker IP
+            for _ip in attacker_ips:
+                try:
+                    _req = _ur2.Request(
+                        "http://127.0.0.1:5000/api/cache/invalidate",
+                        data=_json2.dumps({"src_ip": _ip}).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with _ur2.urlopen(_req, timeout=2):
+                        pass
+                    info(f"    cache cleared: {_ip}\n")
+                except Exception as _ce:
+                    info(f"    cache clear warning for {_ip}: {_ce}\n")
+
+            # Step 2: wipe ALL non-permanent quarantine states immediately —
+            # sends OVS "clear" per quarantined IP so legit traffic is
+            # forwarded without waiting for phase1 to time out.
+            try:
+                _req2 = _ur2.Request(
+                    "http://127.0.0.1:5000/api/quarantine/clear_all",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with _ur2.urlopen(_req2, timeout=2) as _r2:
+                    _resp2 = _json2.loads(_r2.read())
+                info(f"    quarantine cleared: {_resp2.get('cleared', 0)} entries\n")
+            except Exception as _ce2:
+                info(f"    quarantine clear warning: {_ce2}\n")
+
+        except Exception as _e2:
+            info(f"    Warning: backend flush failed: {_e2}\n")
+
+        # Reduced 4s → 1s: cache + quarantine already cleared above,
+        # only need a short pause for switch_delta_pps to settle.
+        info("*** Waiting 1s for switch stats to settle...\n")
+        time.sleep(1)
+        info("    Done — forwarding restored.\n")
     except Exception as e:
         info(f"    Warning: could not clear controller state via ZMQ: {e}\n")
         info("    (OVS rules are flushed; backend will self-clear after TTL expiry)\n")
@@ -731,7 +775,8 @@ def restore_baseline_for_ip(hosts: list, src_ip: str) -> bool:
     """Restart baseline ping for the host with the given IP."""
     for host in hosts:
         if host.IP() == src_ip:
-            host.cmd("pkill -f 'ping -c 30' 2>/dev/null; pkill -f 'ping -i' 2>/dev/null; true")
+            # Kill any leftover finite-count or infinite pings for this host
+            host.cmd("pkill -f 'ping -c 50' 2>/dev/null; pkill -f 'ping -c 300' 2>/dev/null; pkill -f 'ping -i' 2>/dev/null; true")
             others = [
                 h for h in hosts
                 if h.IP() != src_ip and int(h.name[1:]) not in _ATTACKER_NUMS
@@ -740,22 +785,22 @@ def restore_baseline_for_ip(hosts: list, src_ip: str) -> bool:
                 _restore_log.warning("No valid target for %s baseline restore", src_ip)
                 return False
 
-            # Restart all 3 streams just like start_baseline_traffic does
+            # Restart as infinite pings — no -c so flow idle_timeout never kills a batch
             target = others[0].IP()
             host.cmd(
-                f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target}; done) > /dev/null 2>&1 &"
+                f"ping -i {BASELINE_CONT_INTERVAL} {target} > /dev/null 2>&1 &"
             )
             if len(others) > 1:
                 target2 = others[1].IP()
                 host.cmd(
-                    f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target2}; done) > /dev/null 2>&1 &"
+                    f"ping -i {BASELINE_CONT_INTERVAL} {target2} > /dev/null 2>&1 &"
                 )
             if len(others) > 2:
                 target3 = others[2].IP()
                 host.cmd(
-                    f"(while true; do ping -c 300 -i {BASELINE_CONT_INTERVAL} {target3}; done) > /dev/null 2>&1 &"
+                    f"ping -i {BASELINE_CONT_INTERVAL} {target3} > /dev/null 2>&1 &"
                 )
-            _restore_log.info("Restored baseline for %s (3x ping -i %s)", src_ip, BASELINE_CONT_INTERVAL)
+            _restore_log.info("Restored baseline for %s (3x infinite ping -i %s)", src_ip, BASELINE_CONT_INTERVAL)
             return True
     _restore_log.warning("Host %s not found — skipping restore", src_ip)
     return False
@@ -774,17 +819,36 @@ def _restore_poller_loop(hosts: list) -> None:
             _restore_log.debug("Restore poller error: %s", exc)
 
 
+def _baseline_watchdog_loop(hosts: list) -> None:
+    """Safety net: every 30s verify each legit host has an infinite ping running.
+    Restarts it if dead (e.g. killed by quarantine, OOM, or accidental pkill)."""
+    import time as _wt
+    _wlog = _logging.getLogger("baseline-watchdog")
+    while True:
+        _wt.sleep(30)
+        for host in hosts:
+            try:
+                if int(host.name[1:]) in _ATTACKER_NUMS:
+                    continue
+                ps = host.cmd("pgrep -af 'ping -i' 2>/dev/null").strip()
+                if not ps:
+                    #_wlog.warning("Baseline dead on %s (%s) — restarting", host.name, host.IP())
+                    restore_baseline_for_ip(hosts, host.IP())
+            except Exception as exc:
+                _wlog.debug("Watchdog check error %s: %s", host.name, exc)
+
+
 def _start_restore_poller(hosts: list) -> None:
-    """Start the auto-restoration poller. Call once just before TopologyCLI(net)."""
-    t = threading.Thread(
-        target=_restore_poller_loop,
-        args=(hosts,),
-        name="restore-poller",
-        daemon=True,
-    )
+    """Start the auto-restoration poller + baseline watchdog. Call once before TopologyCLI."""
+    t = threading.Thread(target=_restore_poller_loop, args=(hosts,),
+                         name="restore-poller", daemon=True)
     t.start()
-    info(f"*** Auto-restore poller started (polling {BACKEND_API} every "
-         f"{RESTORE_POLL_S:.0f}s)\n")
+    info(f"*** Auto-restore poller started (polling {BACKEND_API} every {RESTORE_POLL_S:.0f}s)\n")
+
+    w = threading.Thread(target=_baseline_watchdog_loop, args=(hosts,),
+                         name="baseline-watchdog", daemon=True)
+    w.start()
+    info("*** Baseline watchdog started (checks every 30s)\n")
 
 
 # ==================================================================
@@ -870,20 +934,20 @@ if __name__ == "__main__":
 
     info("*** Waiting for switches to connect to Ryu...\n")
     _ryu_ready = False
-    for _wait_i in range(16):  # 16 × 0.5s = 8s max
-        time.sleep(0.5)
+    for _wait_i in range(20):  # 20 × 0.3s = 6s max
+        time.sleep(0.3)
         try:
             import urllib.request as _ur
             with _ur.urlopen("http://127.0.0.1:8080/v1.0/topology/switches", timeout=1) as _r:
                 _switches = __import__("json").loads(_r.read())
             if len(_switches) >= 20:
-                info(f"*** All {len(_switches)} switches connected ({(_wait_i+1)*0.5:.1f}s)\n")
+                info(f"*** All {len(_switches)} switches connected ({(_wait_i+1)*0.3:.1f}s)\n")
                 _ryu_ready = True
                 break
             else:
                 info(f"    {len(_switches)}/20 switches connected...\n")
         except Exception:
-            info(f"    Waiting for Ryu... ({(_wait_i+1)*0.5:.1f}s)\n")
+            info(f"    Waiting for Ryu... ({(_wait_i+1)*0.3:.1f}s)\n")
     if not _ryu_ready:
         info("*** Timeout waiting for all switches — proceeding anyway.\n")
 
@@ -891,7 +955,7 @@ if __name__ == "__main__":
 
     info("*** Starting baseline normal traffic...\n")
     start_baseline_traffic(hosts)
-    time.sleep(1)
+    time.sleep(0.5)
 
     _warmup_macs(net, hosts)
 
@@ -899,7 +963,7 @@ if __name__ == "__main__":
     start_baseline_traffic(hosts)
 
     info("*** Waiting for baseline pings to register...\n")
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     # Feature 2: start restore poller before handing off to CLI
     _start_restore_poller(hosts)

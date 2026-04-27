@@ -14,8 +14,11 @@ _DEDUP_TTL   = 10.0
 
 import time as _time
 
-def _is_duplicate(src_ip: str, if_score: float, action_taken: str) -> bool:
-    key = (src_ip, round(if_score, 4), action_taken)
+def _is_duplicate(src_ip: str, if_score: float, action_taken: str,
+                  phase: str | None = None) -> bool:
+    # Include phase in key so every phase transition always creates a new log
+    # entry even if IF score and action_taken are the same within the TTL window.
+    key = (src_ip, round(if_score, 4), action_taken, phase or "")
     now = _time.monotonic()
     with _dedup_lock:
         expired = [k for k, t in _dedup_cache.items() if now - t > _DEDUP_TTL]
@@ -43,6 +46,7 @@ def log_mitigation_event(event: dict) -> None:
         event.get("src_ip", ""),
         event.get("if_score", 0.0),
         event.get("action_taken", ""),
+        event.get("phase"),
     ):
         return
     try:
@@ -67,7 +71,18 @@ def log_mitigation_event(event: dict) -> None:
         log.exception("Failed to write mitigation event for %s", event.get("src_ip"))
 
 
-def log_manual_action(src_ip: str, action: str) -> None:
+def log_manual_action(src_ip: str, action: str,
+                      attack_vector: str = "—",
+                      confidence: float = 0.0,
+                      priority: str = "—",
+                      if_score: float = None,
+                      phase: str = None) -> None:
+    """Log a manual operator action (release/block).
+
+    Preserves the real attack_vector, confidence, priority and if_score from
+    the active IpState so the PDF report shows full details — only the
+    action_taken column changes to 'Manual Release' or 'Manual Block'.
+    """
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         execute("""
@@ -76,10 +91,10 @@ def log_manual_action(src_ip: str, action: str) -> None:
                  confidence, priority, action_taken, if_score, phase, is_manual)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            ts, src_ip, "Manual", "—",
-            0.0, "—",
+            ts, src_ip, "DDoS", attack_vector,
+            confidence, priority,
             action.replace("_", " ").title(),
-            None, None, 1,
+            if_score, phase, 1,
         ))
     except Exception:
         log.exception("Failed to write manual action for %s", src_ip)

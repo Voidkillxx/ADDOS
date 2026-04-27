@@ -11,8 +11,8 @@ let range  = 'Live';
 let prev   = { t: 0, m: 0, n: 0 };
 let ifThr  = 0;
 let logCt  = 0;
-// Bug 3 fix: track log rows by src_ip — update in-place instead of duplicating
-const _logRows = new Map(); // src_ip → <tr> element
+// track log rows by src_ip — { tr, action } so we can detect escalation
+const _logRows = new Map(); // src_ip → { tr, action }
 
 // ── Chart ─────────────────────────────────────────────────────────────────────
 const chart = new Chart(document.getElementById('chart').getContext('2d'), {
@@ -20,9 +20,9 @@ const chart = new Chart(document.getElementById('chart').getContext('2d'), {
   data: {
     labels: [],
     datasets: [
-      { label: 'Incoming',  data: [], borderColor: '#3d6cff', backgroundColor: 'rgba(61,108,255,.07)', borderWidth: 2, pointRadius: 0, fill: true, tension: .4 },
-      { label: 'Blocked',   data: [], borderColor: '#ff3d5a', backgroundColor: 'rgba(255,61,90,.05)',  borderWidth: 2, pointRadius: 0, fill: true, tension: .4, borderDash: [5, 3] },
-      { label: 'Forwarded', data: [], borderColor: '#00d68f', backgroundColor: 'rgba(0,214,143,.05)',  borderWidth: 2, pointRadius: 0, fill: true, tension: .4 },
+      { label: 'Incoming',  data: [], borderColor: '#3d6cff', backgroundColor: 'rgba(61,108,255,.07)', borderWidth: 2, pointRadius: 0, fill: true,  tension: .4 },
+      { label: 'Blocked',   data: [], borderColor: '#ff3d5a', backgroundColor: 'rgba(255,61,90,.10)',  borderWidth: 2, pointRadius: 0, fill: true,  tension: .4, borderDash: [5,3] },
+      { label: 'Forwarded', data: [], borderColor: '#00d68f', backgroundColor: 'rgba(0,214,143,.05)',  borderWidth: 2, pointRadius: 0, fill: false, tension: .4 },
     ],
   },
   options: {
@@ -38,8 +38,8 @@ const chart = new Chart(document.getElementById('chart').getContext('2d'), {
       },
     },
     scales: {
-      x: { ticks: { color: '#5c6080', font: { family: 'Space Mono', size: 9 }, maxRotation: 0 }, grid: { color: '#1e2235' } },
-      y: { ticks: { color: '#5c6080', font: { family: 'Space Mono', size: 9 } }, grid: { color: '#1e2235' }, beginAtZero: true },
+      x:  { ticks: { color: '#5c6080', font: { family: 'Space Mono', size: 9 }, maxRotation: 0 }, grid: { color: '#1e2235' } },
+      y:  { ticks: { color: '#5c6080', font: { family: 'Space Mono', size: 9 } }, grid: { color: '#1e2235' }, beginAtZero: true },
     },
   },
 });
@@ -173,16 +173,19 @@ async function fetchQuarantine() {
         <td class="mono">${conf}</td>
         <td style="color:var(--sub2);font-family:var(--mono);font-size:11px">${time}</td>
         <td><div style="display:flex;gap:6px">
-          <button class="q-btn q-rel" onclick="quarantineAction('release','${e.src_ip}')">Release</button>
-          <button class="q-btn q-blk" onclick="quarantineAction('block','${e.src_ip}')">Blackhole</button>
+          <button class="q-btn q-rel" onclick="event.stopPropagation();quarantineAction('release','${e.src_ip}')">Release</button>
+          <button class="q-btn q-blk" onclick="event.stopPropagation();quarantineAction('block','${e.src_ip}')">Blackhole</button>
         </div></td>`;
 
       if (_qRows.has(e.src_ip)) {
-        // Update stats in-place — no flicker, no duplicate
-        _qRows.get(e.src_ip).innerHTML = inner;
+        const existing = _qRows.get(e.src_ip);
+        existing.dataset.ip = e.src_ip;
+        existing.innerHTML = inner;
       } else {
         const tr = document.createElement('tr');
-        tr.innerHTML = inner;
+        tr.className  = 'tr-clickable';
+        tr.dataset.ip = e.src_ip;
+        tr.innerHTML  = inner;
         _qRows.set(e.src_ip, tr);
         tb.appendChild(tr);
       }
@@ -233,7 +236,16 @@ function addLogRow(ev) {
   const placeholder = tb.querySelector('[colspan]');
   if (placeholder) placeholder.parentElement.remove();
 
-  const ip   = ev.src_ip || '—';
+  const ip         = ev.src_ip || '—';
+  const newAction  = ev.action_taken || '—';
+
+  // Build action label — append ban duration in minutes if available
+  let actionLabel = newAction;
+  if (/time ban/i.test(newAction) && ev.ban_duration_sec) {
+    const mins = Math.round(ev.ban_duration_sec / 60);
+    actionLabel = `Time Ban ${mins}m`;
+  }
+
   const html = `
     <td class="mono">${ev.timestamp      || '—'}</td>
     <td class="ip">${ip}</td>
@@ -241,20 +253,25 @@ function addLogRow(ev) {
     <td>${renderVector(ev.attack_vector  || '—')}</td>
     <td class="mono">${ev.confidence     || '—'}</td>
     <td>${renderPriority(ev.priority     || 'Low')}</td>
-    <td>${renderAction(ev.action_taken   || '—')}</td>`;
+    <td>${renderAction(actionLabel)}</td>`;
 
   if (_logRows.has(ip)) {
-    // IP already in log — update columns in-place, no new row
-    const tr = _logRows.get(ip);
-    tr.innerHTML = html;
-    // Flash highlight to show update
-    tr.style.transition = 'background 0.3s';
-    tr.style.background = 'rgba(61,108,255,0.15)';
-    setTimeout(() => { tr.style.background = ''; }, 600);
-    return;
+    const existing = _logRows.get(ip);
+    if (existing.action !== newAction) {
+      // Action escalated (e.g. Quarantine → Time Ban) — insert NEW row at top
+      // keep old row in place; only update map to latest
+    } else {
+      // Same action — update in-place with flash
+      existing.tr.dataset.ip = ip;
+      existing.tr.innerHTML  = html;
+      existing.tr.style.transition = 'background 0.3s';
+      existing.tr.style.background = 'rgba(61,108,255,0.15)';
+      setTimeout(() => { existing.tr.style.background = ''; }, 600);
+      return;
+    }
   }
 
-  // New IP — insert row at top
+  // New IP or escalated action — insert row at top
   if (logCt >= MAX_LOG) {
     const oldest = tb.querySelector('tr:last-child');
     if (oldest) {
@@ -267,10 +284,11 @@ function addLogRow(ev) {
   }
   set('log-ct', logCt.toString());
 
-  const tr     = document.createElement('tr');
-  tr.className = 'row-in';
-  tr.innerHTML = html;
-  _logRows.set(ip, tr);
+  const tr      = document.createElement('tr');
+  tr.className  = 'row-in tr-clickable';
+  tr.dataset.ip = ip;
+  tr.innerHTML  = html;
+  _logRows.set(ip, { tr, action: newAction });
   tb.insertBefore(tr, tb.firstChild);
 }
 
@@ -412,13 +430,38 @@ function toggleTheme() {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 fetchStats();
-fetchModelInfo();   // M11 fix: called once here, NOT added to setInterval
+fetchModelInfo();
 fetchQuarantine();
 connectSSE();
+fetchRecentEvents();   // replay past events so log is populated on page load
 setInterval(fetchStats,      POLL_MS);
 setInterval(fetchQuarantine, POLL_MS);
-// fetchModelInfo is intentionally absent from setInterval —
-// model config is static for the lifetime of the backend process.
+
+// ── Row-click delegation ──────────────────────────────────────────────────────
+// Single listener on each static <tbody> — survives all innerHTML updates.
+// Reads data-ip from <tr data-ip="...">, skips button/link clicks.
+(function _attachRowDelegation() {
+  ['log-body', 'q-body'].forEach(tbId => {
+    const tb = document.getElementById(tbId);
+    if (!tb) return;
+    tb.addEventListener('click', function(e) {
+      if (e.target.closest('button, a')) return;
+      const tr = e.target.closest('tr[data-ip]');
+      if (!tr) return;
+      const ip = tr.dataset.ip;
+      if (ip && ip !== '—') window.openIpDrawer(ip);
+    });
+  });
+})();
+
+// ── Replay recent events on page load ────────────────────────────────────────
+async function fetchRecentEvents() {
+  try {
+    const events = await apiFetch('/api/recent_events?limit=100');
+    // Events come back oldest-first; addLogRow handles dedup
+    events.forEach(ev => addLogRow(ev));
+  } catch (_) {}
+}
 
 // ── Calendar widget ───────────────────────────────────────────────────────────
 // Text input (type YYYY-MM-DD) + 📅 button that opens a popup calendar.

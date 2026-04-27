@@ -1,6 +1,7 @@
 from flask import Blueprint, jsonify, request
 from backend.mitigation.state_machine import state_machine
 from backend.pipeline.decision_engine import record_false_positive, drain_pending_restores
+from backend.pipeline.flow_tracker import tracker
 
 bp = Blueprint("quarantine", __name__)
 
@@ -56,3 +57,24 @@ def pending_restores():
     """
     ips = drain_pending_restores()
     return jsonify({"ips": ips})
+
+
+# ── Bug fix: inference cache invalidation ─────────────────────────────────────
+
+@bp.post("/api/cache/invalidate")
+def invalidate_cache():
+    """Invalidate the inference cache entry for a specific IP.
+
+    Called by topology.py stop_all_attacks() after the 4s cooldown so the
+    backend re-runs Isolation Forest on fresh normal-traffic features instead
+    of serving the stale attack-time score — which was causing legit baseline
+    traffic to be quarantined after an attack stopped.
+
+    Body: {"src_ip": "10.x.x.x"}
+    """
+    src_ip = (request.get_json(silent=True) or {}).get("src_ip", "").strip()
+    if not src_ip:
+        return jsonify({"error": "src_ip required"}), 400
+
+    tracker.invalidate_cache(src_ip)
+    return jsonify({"ok": True, "src_ip": src_ip})

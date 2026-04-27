@@ -224,6 +224,8 @@ def _process_item(src_ip: str, flow_stats: dict,
 
         if is_anomaly:
             tracker.set_cache(src_ip, if_score, is_anomaly, attack_class, confidence)
+        else:
+            tracker.invalidate_cache(src_ip)
 
         if _result_callback:
             _result_callback(
